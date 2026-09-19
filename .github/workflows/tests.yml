@@ -1,0 +1,30 @@
+name: tests
+
+on:
+  push:
+    branches: [main, python]
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.11 与 Docker 镜像保持一致；3.13 验证本地新环境可装可跑。
+        python-version: ["3.11", "3.13"]
+    defaults:
+      run:
+        working-directory: final
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Run test suite (offline)
+        run: python -m pytest -q

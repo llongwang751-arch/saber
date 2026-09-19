@@ -13,6 +13,9 @@ dist/
 
 # 虚拟环境
 .venv/
+.venv-*/
+.venv313/
+.venvclean/
 .venv-eval/
 venv/
 env/
