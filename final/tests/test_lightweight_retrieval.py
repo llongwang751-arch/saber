@@ -3,6 +3,10 @@ from types import SimpleNamespace
 import pytest
 from sqlalchemy import text
 
+# chromadb 是可选的轻量检索加速组件（见 requirements-lightweight.txt），
+# 未安装时整组测试跳过，保持“离线可跑”的默认体验。
+pytest.importorskip("chromadb")
+
 from internal.application.store import ApplicationStore
 from internal.application.local_repos import LocalRagChunkRepo
 from internal.graph.types import Entity, Relation, ExtractResult

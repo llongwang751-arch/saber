@@ -24,6 +24,7 @@ from internal.experimentation.runtime_identity import (
 )
 from internal.experimentation.service import ExperimentService
 from internal.experimentation.store import ExperimentStore
+from internal.fastapi_compat import iter_all_routes, register_shutdown
 
 from .auth import AuthService, AuthenticationError, ValidationError
 from .medical import MedicalService
@@ -315,18 +316,22 @@ def install_application_features(
     app.include_router(_router())
     app.include_router(create_experiment_router())
     _install_openapi_security(app)
-    app.add_event_handler("shutdown", registry.close)
+    register_shutdown(app, registry.close)
     if outbox_worker is not None:
-        app.add_event_handler("shutdown", outbox_worker.close)
-    app.add_event_handler("shutdown", experiment.close)
-    app.add_event_handler("shutdown", store.close)
+        register_shutdown(app, outbox_worker.close)
+    register_shutdown(app, experiment.close)
+    register_shutdown(app, store.close)
 
 
 def _install_openapi_security(app: FastAPI) -> None:
     def custom_openapi():
         if app.openapi_schema:
             return app.openapi_schema
-        schema = get_openapi(title=app.title, version=app.version, routes=app.routes)
+        schema = get_openapi(
+            title=app.title,
+            version=app.version,
+            routes=list(iter_all_routes(app.routes)),
+        )
         schema.setdefault("components", {}).setdefault("securitySchemes", {})["BearerAuth"] = {
             "type": "http",
             "scheme": "bearer",

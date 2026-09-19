@@ -1,19 +1,22 @@
-fastapi==0.110.0
-uvicorn[standard]==0.29.0
-pydantic==2.6.4
+# 依赖策略：只锁定下限（下限为当前 Docker 镜像 python:3.11-slim 上的已知可用版本），
+# 上限放宽到主版本，使 Python 3.13/3.14 的本地开发环境也能安装。
+# 可选重型加速组件（chromadb）见 requirements-lightweight.txt。
+fastapi>=0.110,<1
+uvicorn[standard]>=0.29,<1
+pydantic>=2.6.4,<3
 SQLAlchemy>=2.0,<3
 alembic>=1.14,<2
-python-multipart==0.0.9
-requests==2.31.0
-pyyaml==6.0.1
-psycopg2-binary==2.9.9
-elasticsearch==8.12.0
-kafka-python==2.0.2
-pymilvus==2.4.0
+python-multipart>=0.0.9
+requests>=2.31.0
+pyyaml>=6.0.1
+psycopg2-binary>=2.9.9
+elasticsearch>=8.12,<9
+kafka-python>=2.0.2
+pymilvus>=2.4.0,<2.5
 # pymilvus 2.4 imports pkg_resources, removed in setuptools 82.
 setuptools<81
 neo4j>=5.0
-PyPDF2==3.0.1
+PyPDF2>=3.0.1
 # marshmallow/environs 并非本仓库直接使用，而是为隔离 pymilvus 传递依赖
 # 与 marshmallow 4.x 的不兼容而 pin（见 README Q1）。
 marshmallow<4
@@ -22,6 +25,9 @@ python-dotenv>=1,<2
 PyJWT>=2.8,<3
 bcrypt>=4,<6
 openpyxl>=3.1,<4
+# FastVectorIndex 的矩阵加速（可选，缺失时自动退回纯 Python 循环），
+# 但测试无条件依赖它，因此作为正式依赖声明。
+numpy>=1.26
 
 # 测试依赖（仓库测试可离线运行：python -m pytest -q）
 pytest>=8

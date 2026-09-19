@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 
 from config.config import APIConfig
 from internal.agent.agent import Response
+from internal.fastapi_compat import iter_all_routes
 from internal.handler.handler import setup_routes
 
 
@@ -332,7 +333,7 @@ def test_python_contains_every_unconditional_go_http_route(wire_client):
 
     actual = {
         (method, normalized(route.path))
-        for route in wire_client.app.routes
+        for route in iter_all_routes(wire_client.app.routes)
         for method in (getattr(route, "methods", None) or set())
     }
     go_subset = {

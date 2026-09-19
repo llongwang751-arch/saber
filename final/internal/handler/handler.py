@@ -25,6 +25,7 @@ from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
 from config.config import APIConfig
+from internal.fastapi_compat import app_lifespan, register_shutdown
 from internal.application.api import current_agent, install_application_features
 from internal.agent.agent import ChatOptions, RequestExecutionContext, Response, UnifiedAgent
 from internal.document.library import DOCUMENT_SOURCE_UPLOAD, WriteRequest
@@ -404,14 +405,14 @@ def setup_routes(
     *,
     auth_required: bool = False,
 ) -> FastAPI:
-    app = FastAPI(title="AGI Assistant", version="1.0")
+    app = FastAPI(title="AGI Assistant", version="1.0", lifespan=app_lifespan)
 
     # 评测平台使用独立 SQLAlchemy/SQLite 存储，不依赖 PG、Milvus 或模型 Key。
     # 因此即使业务基础设施降级，也能离线跑评测集和 Badcase 回归。
     evaluation_service = EvaluationService(local_agent=agent)
     app.state.evaluation_service = evaluation_service
     app.include_router(create_evaluation_router())
-    app.add_event_handler("shutdown", evaluation_service.close)
+    register_shutdown(app, evaluation_service.close)
 
     # CORS：开发期允许全部，生产可由 cfg.cors_origins 收紧
     origins = getattr(cfg, "cors_origins", None) or ["*"]
@@ -495,7 +496,7 @@ def setup_routes(
                     evaluation_registry.production_shared_ready
                 ),
             }
-        app.add_event_handler("shutdown", evaluation_registry.close)
+        register_shutdown(app, evaluation_registry.close)
 
     @app.middleware("http")
     async def production_guardrails(request: Request, call_next):
