@@ -553,19 +553,29 @@ class MedicalService:
         return check_drug_safety(drugs, allergies, conditions)
 
     def calculate_score(self, score_type: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        def _require(key: str, cast):
+            """缺失或非法参数统一抛 ValueError，HTTP 层映射为 400 而非 500。"""
+            value = params.get(key)
+            if value is None or str(value).strip() == "":
+                raise ValueError(f"缺少必需参数: {key}")
+            try:
+                return cast(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"参数 {key} 的值无效: {value!r}") from exc
+
         norm_type = str(score_type or "").strip().lower()
         if "bmi" in norm_type or "体质指数" in norm_type:
-            return calculate_bmi(float(params["height_cm"]), float(params["weight_kg"]))
+            return calculate_bmi(_require("height_cm", float), _require("weight_kg", float))
         elif "gfr" in norm_type or "肌酐" in norm_type or "肾" in norm_type:
             return calculate_gfr(
-                age=int(params["age"]),
-                weight_kg=float(params["weight_kg"]),
-                serum_creatinine_umol_l=float(params["serum_creatinine_umol_l"]),
+                age=_require("age", int),
+                weight_kg=_require("weight_kg", float),
+                serum_creatinine_umol_l=_require("serum_creatinine_umol_l", float),
                 sex=str(params.get("sex", "male")),
             )
         elif "cha2ds2" in norm_type or "vasc" in norm_type or "房颤" in norm_type or "卒中" in norm_type:
             return calculate_cha2ds2_vasc(
-                age=int(params["age"]),
+                age=_require("age", int),
                 sex=str(params.get("sex", "male")),
                 congestive_heart_failure=bool(params.get("chf", False)),
                 hypertension=bool(params.get("hypertension", False)),

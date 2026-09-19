@@ -973,6 +973,21 @@ def setup_routes(
             logger.error("删除文档失败: %s", e)
             raise HTTPException(status_code=500, detail=str(e))
 
+    # 上传白名单：与 document parser 实际支持的格式对齐（PDF / Markdown / 纯文本）。
+    # 二进制垃圾（exe/zip 等）在解析层只会产出乱码文本污染知识库，直接拒绝。
+    upload_allowed_extensions = {".md", ".markdown", ".txt", ".pdf"}
+
+    def _upload_max_bytes() -> int:
+        return max(1024, int(os.getenv("AGI_UPLOAD_MAX_BYTES", str(25 * 1024 * 1024))))
+
+    def _validate_upload_filename(filename: str) -> None:
+        suffix = os.path.splitext(str(filename).replace("\\", "/").split("/")[-1])[1].lower()
+        if suffix not in upload_allowed_extensions:
+            raise HTTPException(
+                status_code=400,
+                detail=f"不支持的文件类型 {suffix or '(无扩展名)'}，仅允许 md/markdown/txt/pdf",
+            )
+
     @app.post("/api/upload")
     async def upload(request: Request):
         try:
@@ -983,16 +998,30 @@ def setup_routes(
             if "application/json" in content_type:
                 payload = await request.json()
                 raw_text = str((payload or {}).get("content", ""))
+                if len(raw_text.encode("utf-8")) > _upload_max_bytes():
+                    raise HTTPException(status_code=413, detail="文档内容超过大小限制")
                 parsed = parse_bytes(filename, upload_content_type, raw_text.encode("utf-8"))
             else:
                 form = await request.form()
                 file = form.get("file")
                 if file is None:
                     raise HTTPException(status_code=400, detail="缺少 file 或 content")
-                content = await file.read()
                 filename = getattr(file, "filename", None) or filename
+                _validate_upload_filename(filename)
                 upload_content_type = getattr(file, "content_type", None) or upload_content_type
-                parsed = parse_bytes(filename, upload_content_type, content)
+                # 分块读取并累计计量：既避免整包读入内存，也让 chunked 编码
+                # （无 Content-Length，绕过全局 body 中间件）同样受大小上限约束。
+                parts: List[bytes] = []
+                total = 0
+                while True:
+                    chunk = await file.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > _upload_max_bytes():
+                        raise HTTPException(status_code=413, detail="文件超过大小限制")
+                    parts.append(chunk)
+                parsed = parse_bytes(filename, upload_content_type, b"".join(parts))
 
             text = parsed.content
             if parsed.needs_ocr:

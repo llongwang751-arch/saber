@@ -203,3 +203,42 @@ def _request(app, method, path, body=b"", content_type="application/json"):
         return status, payload
 
     return asyncio.run(_run())
+
+
+def _multipart_body(filename: str, content: bytes) -> tuple[bytes, str]:
+    boundary = "SmokeBoundary123"
+    body = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+        "Content-Type: application/octet-stream\r\n"
+        "\r\n"
+    ).encode("utf-8") + content + f"\r\n--{boundary}--\r\n".encode("utf-8")
+    return body, f"multipart/form-data; boundary={boundary}"
+
+
+def test_upload_rejects_disallowed_extension():
+    agent = DocumentAPIAgent()
+    app = _client(agent)
+    body, content_type = _multipart_body("payload.exe", b"MZ binary junk")
+
+    status, payload = _request(app, "POST", "/api/upload", body, content_type)
+
+    assert status == 400
+    assert "不支持的文件类型" in payload.decode("utf-8")
+
+
+def test_upload_enforces_size_limit_without_content_length():
+    agent = DocumentAPIAgent()
+    app = _client(agent)
+    body, content_type = _multipart_body("big.md", b"x" * 4096)
+
+    import os as _os
+
+    _os.environ["AGI_UPLOAD_MAX_BYTES"] = "1024"
+    try:
+        status, payload = _request(app, "POST", "/api/upload", body, content_type)
+    finally:
+        _os.environ.pop("AGI_UPLOAD_MAX_BYTES", None)
+
+    assert status == 413
+    assert "超过大小限制" in payload.decode("utf-8")

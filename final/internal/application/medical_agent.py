@@ -398,6 +398,8 @@ def _render_score_response(data: Dict[str, Any]) -> str:
     else:
         md = f"```json\n{json.dumps(data, ensure_ascii=False, indent=2)}\n```"
 
+    md += "\n\n> *免责声明：本计算结果由 AI 临床辅助决策系统生成，仅供注册执业医师诊疗参考。*"
+
     return json.dumps({
         "status": "success",
         "metric": metric,

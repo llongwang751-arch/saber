@@ -4,7 +4,7 @@ services:
     container_name: agi-postgres
     environment:
       POSTGRES_USER: aiagent
-      POSTGRES_PASSWORD: aiagent123
+      POSTGRES_PASSWORD: ${AGI_PG_PASSWORD:?set AGI_PG_PASSWORD in .env (openssl rand -hex 16)}
       POSTGRES_DB: aiagent
     ports:
       - "5432:5432"
@@ -56,8 +56,8 @@ services:
     image: minio/minio:RELEASE.2023-03-20T20-16-18Z
     container_name: agi-milvus-minio
     environment:
-      MINIO_ACCESS_KEY: minioadmin
-      MINIO_SECRET_KEY: minioadmin
+      MINIO_ACCESS_KEY: ${AGI_MINIO_USER:?set AGI_MINIO_USER in .env}
+      MINIO_SECRET_KEY: ${AGI_MINIO_PASSWORD:?set AGI_MINIO_PASSWORD in .env}
     volumes:
       - minio_data:/minio_data
     command: minio server /minio_data
@@ -113,7 +113,7 @@ services:
     image: neo4j:5.18-community
     container_name: agi-neo4j
     environment:
-      NEO4J_AUTH: neo4j/password123
+      NEO4J_AUTH: neo4j/${AGI_NEO4J_PASSWORD:?set AGI_NEO4J_PASSWORD in .env}
       NEO4J_PLUGINS: '["apoc"]'
       NEO4J_dbms_security_procedures_unrestricted: apoc.*
     ports:
@@ -123,7 +123,7 @@ services:
       - neo4j_data:/data
       - neo4j_logs:/logs
     healthcheck:
-      test: ["CMD-SHELL", "cypher-shell -u neo4j -p password123 'RETURN 1' || exit 1"]
+      test: ['CMD-SHELL', 'cypher-shell -u neo4j -p "${AGI_NEO4J_PASSWORD}" "RETURN 1" || exit 1']
       interval: 10s
       timeout: 10s
       retries: 10
@@ -158,6 +158,8 @@ services:
       AGI_EMBEDDING_API_KEY: ${AGI_EMBEDDING_API_KEY:-}
       AGI_EMBEDDING_MODEL: ${AGI_EMBEDDING_MODEL:-}
       AGI_SEARCH_API_KEY: ${AGI_SEARCH_API_KEY:-}
+      AGI_PG_PASSWORD: ${AGI_PG_PASSWORD:?set AGI_PG_PASSWORD in .env}
+      AGI_NEO4J_PASSWORD: ${AGI_NEO4J_PASSWORD:?set AGI_NEO4J_PASSWORD in .env}
     ports:
       - "8090:8090"
     volumes:

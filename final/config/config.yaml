@@ -24,7 +24,7 @@ postgres:
   host: localhost
   port: 5432
   user: aiagent
-  password: aiagent123
+  password: ${AGI_PG_PASSWORD}  # 通过 .env 注入，与 docker-compose 的 Postgres 容器口令保持一致
   database: aiagent
 
 elasticsearch:
@@ -107,7 +107,7 @@ search:
 neo4j:
   uri: "bolt://localhost:7687"
   user: "neo4j"
-  password: "password123"
+  password: "${AGI_NEO4J_PASSWORD}"  # 通过 .env 注入，与 docker-compose 的 Neo4j 容器口令保持一致
   max_hops: 2        # 图遍历最大跳数
   weight: 0.3        # 图检索在 RRF 融合中的权重
   enabled: true      # false 时完全跳过知识图谱
