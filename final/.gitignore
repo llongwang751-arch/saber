@@ -7,11 +7,13 @@ __pycache__/
 build/
 dist/
 .pytest_cache/
+.pytest*/
 .mypy_cache/
 .ruff_cache/
 
 # 虚拟环境
 .venv/
+.venv-eval/
 venv/
 env/
 ENV/
@@ -34,8 +36,18 @@ Thumbs.db
 *.log
 *.tmp
 *.bak
+.codex-pytest-*/
+tmp/
 
 # 含密钥的本地配置
 config/config.local.yaml
 .env
 .env.*
+!.env.example
+
+# 一次性文档抓取 / 本地运行残留（非项目源码）
+yuque_*
+book_toc.json
+doc_asl.xml
+toc_summary.txt
+.harness_events/

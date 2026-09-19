@@ -3,6 +3,8 @@
 
 AGI-assistant 是一个面向个人与企业的多模态智能体系统，融合了检索增强生成（RAG）、三层记忆、知识图谱、沙箱执行与可恢复执行流，支持多轮对话、知识检索、工具调用与复杂推理。系统具备高可用性、可扩展性与工程落地能力。
 
+> 当前分支是 Python/FastAPI 实现，运行目录为 `final/`。快速启动见 [final/README.md](./final/README.md)，架构见 [系统架构与核心流程图](./final/docs/系统架构与核心流程图.md)，完整截图手册见 [全功能跑通与面试演示指南](./final/docs/全功能跑通与面试演示指南.md)，岗位讲解见 [腾讯医疗 AI Agent 质量评测面试准备](./final/docs/腾讯医疗AI-Agent质量评测面试准备.md)。Go 原版仍保留在 `main` 分支，二者互不覆盖。
+
 ## 项目特性
 
 - **多阶段智能体核心**：支持纯对话、RAG 检索、单工具调用、多工具编排（ReAct）等多种智能体模式，自动路由。
@@ -11,7 +13,9 @@ AGI-assistant 是一个面向个人与企业的多模态智能体系统，融合
 - **图增强记忆**：长期记忆叠加 Neo4j 图层，支持 FOLLOWS、SIMILAR_TO、CAUSES、BELONGS_TO 等关系，提升历史联想与推理能力。
 - **工具链与可恢复执行**：内置时间、天气、搜索、RAG 检索、命令执行等工具，支持 ReAct 规划-执行-生成流程，任务快照与重试机制保障稳定性。
 - **沙箱执行**：支持 Docker / Local / Mock 三种沙箱后端，资源限制（CPU/内存/PID/网络），命令白名单安全校验。
-- **高可用基础设施**：PostgreSQL 持久化、Milvus/ES/Neo4j/Kafka 可选，自动优雅降级，适配多种部署环境。
+- **质量评测闭环**：不可变数据集、Replay/Local/HTTP Adapter、10 项确定性指标、安全硬门禁、Trace、Badcase、回归对比与报告导出。
+- **多用户业务工作台**：JWT 登录与租户隔离，Vue 3 界面集成知识库、Skill 广场、智慧云诊室（预问诊/临床计算/用药安全）、记忆治理和 Agent 评测。
+- **双层持久化**：纯本地 SQLite 可保存文档、RAG、记忆、技能、门诊病历和评测数据；PostgreSQL、Milvus、ES、Neo4j、Kafka 可选增强。
 
 ---
 
@@ -20,14 +24,12 @@ AGI-assistant 是一个面向个人与企业的多模态智能体系统，融合
 
 ```mermaid
 graph TB
-    subgraph Frontend["前端 (index.html)"]
-        CHAT["对话区"]
-        SIDEBAR["侧边栏<br/>知识库上传 / 近期对话"]
-        CTRL["控制栏<br/>知识库开关 / 工具选择"]
-    end
+    CTRL["HTTP 路由层 (FastAPI /api/*)"]
+    R["Router 意图路由"]
 
-    subgraph Router["智能路由层"]
-        R["Router"]
+    subgraph Frontend["Vue 3 + Pinia 工作台"]
+        CHAT["对话区"]
+        SIDEBAR["知识库 / 近期对话"]
     end
 
     subgraph Core["核心能力"]
@@ -355,60 +357,57 @@ sequenceDiagram
 
 ### 本地运行
 
-```bash
-# 1. 安装依赖
-go mod tidy
-
-# 2. 启动基础设施（需要 Docker Desktop）
-docker compose up -d
-
-# 3. 启动应用
-go run .
-
-# 4. 访问 http://localhost:8090
+```powershell
+Set-Location final
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+Copy-Item .env.example .env
+# 编辑 .env 后，将变量加载到当前终端；详细命令见 final/README.md
+python -m alembic upgrade head
+python main.py
 ```
+
+访问 `http://localhost:8090`，首次使用先注册账号。无需外部基础设施也可完整体验本地持久化、知识库、智慧云诊室（预问诊/临床计算/用药安全）和离线 Agent 评测。
 
 ### Docker 部署
 
 ```bash
-# 编译 + 启动全部服务
-CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o final-agent .
+cd final
 docker compose up -d --build
 ```
 
 ### 配置
 
-编辑 `config/config.yaml`，填入 API Key：
+复制 `final/.env.example` 并通过环境变量提供凭证：
 
-- `llm.api_key` — 火山引擎 Ark 对话模型 API Key
-- `embedding.api_key` — 火山引擎 Embedding 模型 API Key
-- `search.api_key` — Tavily 搜索 API Key（可选）
+- `AGI_JWT_SECRET` — 至少 32 位的随机字符串
+- `AGI_LLM_API_URL` / `AGI_LLM_API_KEY` / `AGI_LLM_MODEL`
+- `AGI_EMBEDDING_API_URL` / `AGI_EMBEDDING_API_KEY` / `AGI_EMBEDDING_MODEL`
+- `AGI_SEARCH_API_KEY` — 搜索服务 Key（可选）
 
-> 所有基础设施（Milvus/PG/ES/Kafka/Neo4j）均为可选，连接失败自动降级为内存模式，不影响启动。
+> 不要将真实 API Key 写入 Git。外部基础设施均为可选；连接失败会降级到 `final/runtime/` 下的本地 SQLite，而不是丢数据的内存 mock。
 
 ---
 
 ## 目录结构
 
 ```
-├── config/                   配置加载（YAML → 结构体）
-│   ├── config.go
-│   └── config.yaml
-├── internal/
-│   ├── agent/                智能体核心与调度（ReAct + Harness + 路由）
-│   ├── graph/                知识图谱（Neo4j 实体关系抽取 + 图检索）
-│   ├── handler/              HTTP API 路由处理
-│   ├── infra/                基础设施连接（Milvus / PG / ES / Kafka）
-│   ├── llm/                  LLM/Embedding 客户端（真实 API + Mock 降级）
-│   ├── memory/               三层记忆系统（短期 / 长期 / 用户偏好 + 图增强）
-│   ├── rag/                  RAG 引擎（三路混合检索 + RRF 融合）
-│   ├── sandbox/              沙箱执行（Docker / Local / Mock + 安全校验）
-│   └── tools/                工具定义与调用（time/weather/search/exec_command）
-├── frontend/                 单文件前端 HTML
-├── main.go                   入口
-├── docker-compose.yml        基础设施编排
-├── Dockerfile                应用容器镜像
-└── go.mod
+├── final/
+│   ├── main.py                       FastAPI 入口
+│   ├── web/                          Vue 3 + Pinia + Vite 前端
+│   ├── internal/
+│   │   ├── agent/                    Agent、路由、恢复与用户实例注册表
+│   │   ├── application/              认证、技能、智慧养殖、本地持久化
+│   │   ├── evaluation/               评测、Trace、Badcase 与报告
+│   │   ├── rag/ / memory/ / graph/   检索、记忆和知识图谱
+│   │   └── handler/                  HTTP、中间件和静态资源
+│   ├── alembic/                      17 段数据库迁移
+│   ├── tests/                        单元、契约、迁移与端到端测试
+│   ├── runtime/                      本地数据库和报告（运行时生成）
+│   ├── Dockerfile
+│   └── docker-compose.yml
+└── README.md
 ```
 
 ---

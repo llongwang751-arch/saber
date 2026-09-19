@@ -147,11 +147,22 @@ services:
         condition: service_started
     environment:
       AGI_CONFIG: /app/config/config.yaml
-      FRONTEND_DIR: /app/frontend
+      FRONTEND_DIR: /app/web/dist
+      AGI_EVAL_DATABASE_URL: sqlite:////app/runtime/application.db
+      AGI_AUTH_REQUIRED: "1"
+      AGI_JWT_SECRET: ${AGI_JWT_SECRET:?JWT secret required, generate one with openssl rand -hex 32}
+      AGI_LLM_API_URL: ${AGI_LLM_API_URL:-}
+      AGI_LLM_API_KEY: ${AGI_LLM_API_KEY:-}
+      AGI_LLM_MODEL: ${AGI_LLM_MODEL:-}
+      AGI_EMBEDDING_API_URL: ${AGI_EMBEDDING_API_URL:-}
+      AGI_EMBEDDING_API_KEY: ${AGI_EMBEDDING_API_KEY:-}
+      AGI_EMBEDDING_MODEL: ${AGI_EMBEDDING_MODEL:-}
+      AGI_SEARCH_API_KEY: ${AGI_SEARCH_API_KEY:-}
     ports:
       - "8090:8090"
     volumes:
       - ./config/config.yaml:/app/config/config.yaml:ro
+      - app_runtime:/app/runtime
 
 volumes:
   postgres_data:
@@ -162,3 +173,4 @@ volumes:
   kafka_data:
   neo4j_data:
   neo4j_logs:
+  app_runtime:

@@ -3,12 +3,16 @@ llm:
   api_url: https://ark.cn-beijing.volces.com/api/v3/chat/completions
   api_key: ""
   model: deepseek-v4-flash-260425
+  fast_model: ""  # 留空时回退主模型
   temperature: 0.7
 
 embedding:
   api_url: https://ark.cn-beijing.volces.com/api/v3/embeddings/multimodal
   api_key: ""
   model: doubao-embedding-vision-250615
+  failure_threshold: 3
+  cooldown_seconds: 30
+  half_open_max_calls: 1
 
 # 向量数据库配置
 milvus:
@@ -40,15 +44,32 @@ rag:
   chunk_overlap: 50
   top_k: 3
   rrf_constant_k: 60
+  # Go 845e8f7 兼容字段；当前 RRF 中 Milvus/ES 均使用 1.0 权重。
   semantic_weight: 0.7
   enable_hybrid_search: true
   rag_milvus_dim: 2048
+  # 只对成功 Rerank 后的 0~1 相关性分数生效；RRF 分数不具备同一语义。
+  no_answer_threshold: 0.30
+  # 父块字符 3-gram/编辑相似度近重复阈值；这是词法近似，不冒充语义模型分数。
+  parent_dedup_threshold: 0.85
   rewrite:
     enabled: true
     num_queries: 3
   rerank:
     enabled: true
     preview_len: 200
+    # 连续失败 3 次后打开熔断器；冷却 30 秒后只放 1 个半开探测请求。
+    failure_threshold: 3
+    cooldown_seconds: 30
+    half_open_max_calls: 1
+    # local_overlap 是零依赖确定性备用精排，不等同于 Cross-Encoder。
+    fallback_mode: local_overlap
+    # 切换 fallback_mode=cross_encoder 后填写本地路径或 HuggingFace 模型名。
+    cross_encoder_model: ""
+  retrieval_circuit:
+    failure_threshold: 3
+    cooldown_seconds: 30
+    half_open_max_calls: 1
 
 memory:
   short_term_max_turns: 5
@@ -71,13 +92,16 @@ graph_runtime:
   max_parallel: 2
   race_timeout_ms: 30000
   enable_racing: true
+  replan_enabled: true
+  max_replan: 2
+  replan_on_failed: true
 
 server:
   port: "8090"
 
 search:
   api_key: ""               # 请填入你的 Tavily API Key（可选）
-  api_url: "https://tavily.com"
+  api_url: "https://api.tavily.com/search"
 
 # ===== 知识图谱（Neo4j，可选，不可用时跳过图检索）=====
 neo4j:
@@ -100,6 +124,7 @@ sandbox:
   max_pids: 64
   network_disabled: true
   readonly_rootfs: true
+  artifact_host_dir: "~/Desktop/agi-saber"
 
 # ===== 命令安全校验 =====
 security:
@@ -115,3 +140,20 @@ security:
     - "node"
     - "go"
     - "java"
+
+auth:
+  jwt_secret: "${JWT_SECRET}"
+  jwt_ttl_hours: 168
+  jwt_issuer: "agi-assistant"
+
+observability:
+  trace_retention_days: 30
+  pprof:
+    enabled: false
+    admin_token: "${PPROF_ADMIN_TOKEN}"
+
+skillhub:
+  enabled: true
+  github_token: "${GITHUB_TOKEN}"
+  keyword: "office assistant"
+  cache_ttl_min: 30

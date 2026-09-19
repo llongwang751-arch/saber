@@ -1235,7 +1235,7 @@ function renderLibraryDocs() {
   const el = document.getElementById('libraryDocList');
   if (!el) return;
   if (libraryDocs.length === 0) {
-    el.innerHTML = '<div class="doc-empty">暂无本地文档。让 Agent 生成报告并保存后，会出现在这里。</div>';
+    el.innerHTML = '<div class="doc-empty">暂无本地文档。上传或保存的文档会出现在这里。</div>';
     return;
   }
   el.innerHTML = libraryDocs.slice(0, 8).map(d => `
@@ -1297,7 +1297,7 @@ async function ingestDocumentByID(id) {
 function maybeRefreshLibraryAfterTool(toolName) {
   if (!toolName) return;
   const name = String(toolName);
-  if (['write_document', 'ingest_document', 'doc_agent'].some(t => name.includes(t))) {
+  if (['write_document', 'ingest_document'].some(t => name.includes(t))) {
     loadLibraryDocs();
   }
 }

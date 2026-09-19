@@ -16,8 +16,10 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-# 默认前端目录指向 final/frontend，避免 cwd 不在项目根时挂载失败
-os.environ.setdefault("FRONTEND_DIR", os.path.join(PROJECT_ROOT, "frontend"))
+# Prefer the complete Vue build; keep the legacy single-file UI as fallback.
+vue_dist = os.path.join(PROJECT_ROOT, "web", "dist")
+legacy_frontend = os.path.join(PROJECT_ROOT, "frontend")
+os.environ.setdefault("FRONTEND_DIR", vue_dist if os.path.isdir(vue_dist) else legacy_frontend)
 
 from config.config import default_config  # noqa: E402
 from internal.agent.agent import UnifiedAgent  # noqa: E402
@@ -41,9 +43,23 @@ class Deps:
 
 def build_deps():
     cfg = default_config()
+    from internal.application.auth import KNOWN_DEVELOPMENT_SECRETS
+
+    auth_required = os.environ.get("AGI_AUTH_REQUIRED", "1").strip().lower() not in {"0", "false", "no", "off"}
+    jwt_secret = str(cfg.auth_jwt_secret or "")
+    if auth_required and (
+        len(jwt_secret.encode("utf-8")) < 32
+        or jwt_secret in KNOWN_DEVELOPMENT_SECRETS
+    ):
+        raise RuntimeError(
+            "JWT 密钥必须是不少于 32 字节的强随机值且不能是公开的开发密钥；"
+            "请设置 AGI_JWT_SECRET 或 JWT_SECRET"
+        )
+    if cfg.pprof_enabled and not str(cfg.pprof_admin_token or "").strip():
+        raise RuntimeError("诊断端点已启用但 PPROF_ADMIN_TOKEN 未配置，拒绝启动")
     inf = Infrastructure(cfg)
     agent = UnifiedAgent(cfg, inf)
-    app = setup_routes(agent, inf, cfg)
+    app = setup_routes(agent, inf, cfg, auth_required=auth_required)
     return Deps(cfg=cfg, inf=inf, agent=agent, app=app)
 
 
@@ -55,7 +71,8 @@ def main():
 
         import uvicorn
 
-        uvicorn.run(deps.app, host="0.0.0.0", port=int(deps.cfg.server_port))
+        port = int(os.environ.get("AGI_SERVER_PORT", deps.cfg.server_port))
+        uvicorn.run(deps.app, host="0.0.0.0", port=port)
     finally:
         if deps is not None:
             try:
@@ -65,7 +82,7 @@ def main():
 
 
 def print_banner(cfg, inf):
-    addr = f":{cfg.server_port}"
+    addr = f":{os.environ.get('AGI_SERVER_PORT', cfg.server_port)}"
     print("========================================")
     print("Final Stage · AGI 智能助手启动成功")
     print("========================================")
