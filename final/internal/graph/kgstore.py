@@ -33,8 +33,13 @@ class KGStore:
         cfg: APIConfig,
         neo4j_client: Neo4jClient,
         llm_fn: Optional[LLMFn] = None,
+        *,
+        user_id: str,
     ):
+        if not isinstance(user_id, str) or not user_id.strip():
+            raise ValueError("KGStore requires a non-empty user_id")
         self.neo4j = neo4j_client
+        self.user_id = user_id
         self.max_hops = cfg.kg_max_hops
         self.kg_weight = cfg.kg_weight
         self.extractor = Extractor(llm_fn)
@@ -81,11 +86,15 @@ class KGStore:
     def _upsert_entity(self, ent: Entity) -> None:
         """MERGE 实体节点（幂等）"""
         query = (
-            "MERGE (e:Entity {name: $name}) "
-            "SET e.type = $type, e.doc_hash = $doc_hash, e.chunk_id = $chunk_id, e.pg_id = $pg_id"
+            "MERGE (e:Entity {user_id: $user_id, name: $name}) "
+            "SET e.type = $type "
+            "MERGE (c:RAGChunk {user_id: $user_id, pg_id: $pg_id}) "
+            "SET c.doc_hash = $doc_hash, c.chunk_id = $chunk_id "
+            "MERGE (e)-[:MENTIONED_IN {user_id: $user_id}]->(c)"
         )
         try:
             self.neo4j.run_cypher(query, {
+                "user_id": self.user_id,
                 "name": ent.name,
                 "type": str(ent.type),
                 "doc_hash": ent.doc_hash,
@@ -100,13 +109,14 @@ class KGStore:
         动态关系类型无法用参数传递，必须拼入查询字符串；安全性由 extractor 已过滤非法类型保证。
         """
         query = (
-            "MERGE (a:Entity {name: $from}) "
-            "MERGE (b:Entity {name: $to}) "
-            f"MERGE (a)-[r:{rel.rel_type} {{doc_hash: $doc_hash}}]->(b) "
+            "MERGE (a:Entity {user_id: $user_id, name: $from}) "
+            "MERGE (b:Entity {user_id: $user_id, name: $to}) "
+            f"MERGE (a)-[r:{rel.rel_type} {{user_id: $user_id, doc_hash: $doc_hash}}]->(b) "
             "SET r.chunk_id = $chunk_id, r.pg_id = $pg_id"
         )
         try:
             self.neo4j.run_cypher(query, {
+                "user_id": self.user_id,
                 "from": rel.from_name,
                 "to": rel.to_name,
                 "doc_hash": rel.doc_hash,
@@ -124,25 +134,49 @@ class KGStore:
             return
         try:
             self.neo4j.run_cypher(
-                "MATCH ()-[r {doc_hash: $doc_hash}]-() DELETE r",
-                {"doc_hash": doc_hash},
+                "MATCH (a:Entity {user_id: $user_id})"
+                "-[r {user_id: $user_id, doc_hash: $doc_hash}]-"
+                "(b:Entity {user_id: $user_id}) DELETE r",
+                {"user_id": self.user_id, "doc_hash": doc_hash},
             )
         except Exception as e:
             logger.warning("⚠️  Neo4j 删除文档关系失败: %s", e)
         try:
             self.neo4j.run_cypher(
-                "MATCH (e:Entity) WHERE NOT (e)--() AND e.doc_hash = $doc_hash DELETE e",
-                {"doc_hash": doc_hash},
+                "MATCH (c:RAGChunk {user_id: $user_id, doc_hash: $doc_hash}) DETACH DELETE c",
+                {"user_id": self.user_id, "doc_hash": doc_hash},
+            )
+            self.neo4j.run_cypher(
+                "MATCH (e:Entity {user_id: $user_id}) WHERE NOT (e)--() DELETE e",
+                {"user_id": self.user_id, "doc_hash": doc_hash},
             )
         except Exception as e:
             logger.warning("⚠️  Neo4j 清理孤立节点失败: %s", e)
 
     # ─────────────────────────────── 图检索 ────────────────────────────────
 
+    def _backfill_legacy_provenance(self):
+        """Preserve the last known legacy source; overwritten sources require reindexing."""
+        if getattr(self, "_provenance_backfilled", False):
+            return
+        try:
+            self.neo4j.run_cypher(
+                "MATCH (e:Entity {user_id: $user_id}) WHERE e.pg_id IS NOT NULL "
+                "AND e.doc_hash IS NOT NULL "
+                "MERGE (c:RAGChunk {user_id: $user_id, pg_id: e.pg_id}) "
+                "ON CREATE SET c.doc_hash = e.doc_hash, c.chunk_id = e.chunk_id "
+                "MERGE (e)-[:MENTIONED_IN {user_id: $user_id}]->(c)",
+                {"user_id": self.user_id})
+            self._provenance_backfilled = True
+        except Exception:
+            logger.warning("Legacy graph provenance backfill failed; retry on next search")
+
     def search(self, query_text: str, top_k: int) -> List[GraphSearchResult]:
         """根据查询文本抽取实体，执行 1~2 跳子图遍历，返回关联的 ChunkID。"""
         if not self.available():
             return []
+
+        self._backfill_legacy_provenance()
 
         # 抽取查询中的实体
         extracted = self.extractor.extract(query_text)
@@ -160,22 +194,30 @@ class KGStore:
             hops = 3
 
         query = """
-	MATCH (e:Entity) WHERE e.name IN $names
-	CALL apoc.path.subgraphNodes(e, {
+	MATCH (e:Entity {user_id: $user_id}) WHERE e.name IN $names
+	CALL apoc.path.expandConfig(e, {
+	  minLevel: 0,
 	  maxLevel: $hops,
-	  relationshipFilter: "RELATES_TO|PART_OF|CAUSES|DESCRIBES|MENTIONS|WORKS_FOR|LOCATED_IN"
+	  relationshipFilter: "RELATES_TO|PART_OF|CAUSES|DESCRIBES|MENTIONS|WORKS_FOR|LOCATED_IN",
+	  uniqueness: "NODE_GLOBAL"
 	})
-	YIELD node AS neighbor
-	WHERE neighbor:Entity AND neighbor.chunk_id IS NOT NULL
-	WITH e.name AS seed, neighbor.name AS nb, neighbor.chunk_id AS cid,
-	     COALESCE(neighbor.pg_id, 0) AS pgid,
-	     toInteger(apoc.node.degree(neighbor)) AS degree
+	YIELD path
+	WITH e, path, last(nodes(path)) AS neighbor
+	WHERE neighbor:Entity AND neighbor.user_id = $user_id 
+	  AND ALL(node IN nodes(path) WHERE node:Entity AND node.user_id = $user_id)
+	  AND ALL(rel IN relationships(path) WHERE rel.user_id = $user_id)
+	MATCH (neighbor)-[:MENTIONED_IN {user_id: $user_id}]->(c:RAGChunk {user_id: $user_id})
+	WITH e.name AS seed, neighbor.name AS nb, c.chunk_id AS cid,
+	     c.pg_id AS pgid,
+	     size([(neighbor)-[rel]-(peer:Entity)
+	           WHERE rel.user_id = $user_id AND peer.user_id = $user_id | 1]) AS degree
 	RETURN cid, pgid, collect(DISTINCT seed) AS seeds, collect(DISTINCT nb) AS neighbors, max(degree) AS deg
 	ORDER BY size(seeds) DESC, deg DESC
 	LIMIT $limit"""
 
         try:
             records = self.neo4j.run_cypher(query, {
+                "user_id": self.user_id,
                 "names": names,
                 "hops": int(hops),
                 "limit": int(top_k * 3),
@@ -225,10 +267,12 @@ class KGStore:
         """APOC 不可用时的降级版本：直接匹配实体所在 chunk"""
         try:
             records = self.neo4j.run_cypher(
-                "MATCH (e:Entity) WHERE e.name IN $names AND e.chunk_id IS NOT NULL "
-                "RETURN e.chunk_id AS cid, COALESCE(e.pg_id, 0) AS pgid, e.name AS name "
+                "MATCH (e:Entity {user_id: $user_id}) "
+                "WHERE e.name IN $names "
+                "MATCH (e)-[:MENTIONED_IN {user_id: $user_id}]->(c:RAGChunk {user_id: $user_id}) "
+                "RETURN c.chunk_id AS cid, c.pg_id AS pgid, e.name AS name "
                 "ORDER BY cid LIMIT $limit",
-                {"names": names, "limit": int(top_k)},
+                {"user_id": self.user_id, "names": names, "limit": int(top_k)},
             )
         except Exception:
             return []

@@ -11,10 +11,12 @@
 #
 # 本文件只负责：构造 + 路由分派 + 图调度入口（react 模式走 GraphRuntime）。
 import json
+import inspect
 import logging
 import re
 import threading
 import time
+import uuid
 from dataclasses import asdict
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -44,12 +46,15 @@ from internal.promptctx import (
     ToolStateTracker,
     default_schemas,
 )
+from internal.observability import redact_text, sanitize_trace
 from internal.rag.rag import Engine as RAGEngine
 from internal.rag.reranker import LLMReranker
+from internal.rag.local_reranker import LocalCrossEncoderReranker, LocalOverlapReranker
 from internal.rag.rewriter import HistoryMessage, LLMRewriter
 from internal.tools.tools import Tool, ToolExecutor, default_tools, new_mcp_tool
 
 from .cancel import CancelRegistry, go_safe
+from .artifact import prepare_artifact_workspace, produce_artifact
 from .graph_runtime import GraphConfig, GraphRuntime
 from .init_sandbox import init_sandbox
 from .memory_writer import (
@@ -59,8 +64,8 @@ from .memory_writer import (
     maybe_consolidate_memory,
 )
 from .restore import init_knowledge_graph, restore_from_db, restore_rag_from_db
-from .router import detect_tool, need_rag, need_react, need_react_from_tools, need_tool
-from .planner import llm_plan_graph
+from .router import detect_tool
+from .planner import llm_plan_graph, needs_subagent_plan, subagent_pipeline_nodes
 from .status import infra_status, status as build_status
 from .subagents import register_builtin_subagents
 
@@ -85,8 +90,22 @@ class ReActStep:
 @dataclass
 class ChatOptions:
     use_rag: bool = False
-    selected_tools: Optional[List[str]] = None
-    explicit: bool = False
+    conversation_id: str = ""
+
+
+@dataclass(frozen=True)
+class RequestExecutionContext:
+    """Server-created per-request context; it is not part of the chat wire API.
+
+    Online experiments may only inject a pre-compiled allowlist here.  Never
+    mutate ``UnifiedAgent.cfg``: one Agent instance can serve concurrent
+    requests and a shared mutation would mix variants.
+    """
+
+    runtime_overrides: Dict[str, Any] = field(default_factory=dict)
+    experiment_exposure_id: str = ""
+    runtime_strategy_checksum: str = ""
+    trace_id: str = ""
 
 
 @dataclass
@@ -94,27 +113,45 @@ class Response:
     query: str
     answer: str = ""
     mode: str = "chat"
+    # ``mode`` describes the execution path (react/rag); these fields carry
+    # the business semantics extracted by deterministic domain tools.
+    intent: Optional[str] = None
+    slots: Dict[str, Any] = field(default_factory=dict)
+    fallback: bool = False
+    error: Optional[str] = None
     steps: List[ReActStep] = field(default_factory=list)
     tool_call: Optional[Dict[str, Any]] = None
+    tool_calls: List[Dict[str, Any]] = field(default_factory=list)
     search_results: List[dict] = field(default_factory=list)
+    rag_trace: Dict[str, Any] = field(default_factory=dict)
     task: Optional[dict] = None
     extracted_info: str = ""
     short_term_count: int = 0
     long_term_count: int = 0
     preferences: Dict[str, str] = field(default_factory=dict)
     interrupted: bool = False
+    trace_id: str = ""
+    # The public HTTP response only exposes the opaque exposure id.  The
+    # strategy checksum is retained in the tenant-scoped trace for audit.
+    experiment_exposure_id: str = ""
+    runtime_strategy_checksum: str = ""
 
 
 class UnifiedAgent:
     """统一智能体入口。负责装配各子模块、路由分派与 ReAct 推理循环。"""
 
-    def __init__(self, cfg: APIConfig, inf: Infrastructure):
+    def __init__(self, cfg: APIConfig, inf: Infrastructure, user_id: str = "default_user"):
         self.cfg = cfg
         self.inf = inf
+        self.user_id = str(user_id or "default_user")
+        self.conversation_id = ""
+        self._turn_lock = threading.Lock()
+        from .conversations import ConversationPool
+        self._conversations = ConversationPool(self)
         self.llm = LLMClient(cfg)
         self.stm = ShortTerm(cfg.short_term_max_turns)
-        self.ltm = LongTerm(cfg, inf)
-        self.preference = Preference("default_user", inf)
+        self.ltm = LongTerm(cfg, inf, self.user_id)
+        self.preference = Preference(self.user_id, inf)
         # 三层记忆 + 偏好聚合容器（与 main memoryStack 对齐）。
         # graph_memory 由 init_knowledge_graph 在末尾通过 attach_graph 注入。
         self.mem = MemoryStack(stm=self.stm, ltm=self.ltm, preference=self.preference)
@@ -129,7 +166,7 @@ class UnifiedAgent:
 
         # RAG 引擎构造失败不致命：降级为禁用知识库
         try:
-            self.rag = RAGEngine(cfg, inf, self.llm)
+            self.rag = RAGEngine(cfg, inf, self.llm, user_id=self.user_id)
         except Exception as e:
             logger.warning("⚠️  RAG 引擎初始化失败: %s（已禁用知识库）", e)
             self.rag = None
@@ -146,6 +183,10 @@ class UnifiedAgent:
         # 取消令牌注册表 + 兼容旧接口的 process-level cancel event
         self._cancel_registry = CancelRegistry()
         self._memory_lock = threading.Lock()
+        from internal.harness.approval import HumanInTheLoopPlugin
+        from internal.harness.guardrails import SecurityGuardrailPlugin
+        self.human_approval = HumanInTheLoopPlugin(journal=getattr(inf.repo, "action_journal", None))
+        self.execution_plugins = [SecurityGuardrailPlugin(), self.human_approval]
 
         # 异步记忆写入器（单 worker 线程串行化）
         self.memory_writer = AsyncMemoryWriter()
@@ -159,9 +200,25 @@ class UnifiedAgent:
             try:
                 self.rag.set_generate_fn(self._llm_generate)
                 if getattr(cfg, "rag_rewrite_enabled", False):
-                    self.rag.set_rewriter(LLMRewriter(self._llm_generate, cfg.rag_rewrite_num_queries))
+                    self.rag.set_rewriter(LLMRewriter(self._llm_generate_fast, cfg.rag_rewrite_num_queries))
                 if getattr(cfg, "rag_rerank_enabled", False):
-                    self.rag.set_reranker(LLMReranker(self._llm_generate, cfg.rag_rerank_preview_len))
+                    fallback_mode = getattr(cfg, "rag_rerank_fallback_mode", "rrf")
+                    fallback_reranker = None
+                    if fallback_mode == "local_overlap":
+                        fallback_reranker = LocalOverlapReranker()
+                    elif fallback_mode == "cross_encoder":
+                        fallback_reranker = LocalCrossEncoderReranker(
+                            getattr(cfg, "rag_rerank_cross_encoder_model", ""),
+                            fallback_reranker=LocalOverlapReranker(),
+                        )
+                    self.rag.set_reranker(LLMReranker(
+                        self._llm_generate_fast,
+                        cfg.rag_rerank_preview_len,
+                        failure_threshold=cfg.rag_rerank_failure_threshold,
+                        cooldown_seconds=cfg.rag_rerank_cooldown_seconds,
+                        half_open_max_calls=cfg.rag_rerank_half_open_max_calls,
+                        fallback_reranker=fallback_reranker,
+                    ))
             except Exception as e:
                 logger.warning("⚠️  RAG generate 函数注入失败: %s", e)
 
@@ -246,24 +303,52 @@ class UnifiedAgent:
         self._cancel_registry.cancel_all()
 
     def process(self, query: str) -> Response:
-        return self.process_with_options(query, ChatOptions(explicit=False))
+        return self.process_with_options(query, ChatOptions())
 
-    def process_with_options(self, query: str, opts: ChatOptions) -> Response:
+    def process_with_options(
+        self,
+        query: str,
+        opts: ChatOptions,
+        execution_context: Optional[RequestExecutionContext] = None,
+    ) -> Response:
+        if opts.conversation_id and self._conversations is not None:
+            with self._conversations.lease(opts.conversation_id) as scoped:
+                return scoped.process_with_options(query, ChatOptions(use_rag=opts.use_rag), execution_context)
         token, unregister = self._cancel_registry.register()
         try:
-            return self._dispatch(query, opts, token)
+            return self._dispatch(
+                query,
+                opts,
+                token,
+                execution_context=execution_context,
+            )
         finally:
             unregister()
 
-    def process_stream(self, query: str, opts: ChatOptions, on_event) -> Response:
+    def process_stream(
+        self,
+        query: str,
+        opts: ChatOptions,
+        on_event,
+        execution_context: Optional[RequestExecutionContext] = None,
+    ) -> Response:
+        if opts.conversation_id and self._conversations is not None:
+            with self._conversations.lease(opts.conversation_id) as scoped:
+                return scoped.process_stream(query, ChatOptions(use_rag=opts.use_rag), on_event, execution_context)
         token, unregister = self._cancel_registry.register()
         try:
-            return self._dispatch(query, opts, token, on_event)
+            return self._dispatch(
+                query,
+                opts,
+                token,
+                on_event,
+                execution_context=execution_context,
+            )
         finally:
             unregister()
 
     def route(self, user_input: str, use_rag: bool = False) -> str:
-        return self.process_with_options(user_input, ChatOptions(use_rag=use_rag, explicit=False)).answer
+        return self.process_with_options(user_input, ChatOptions(use_rag=use_rag)).answer
 
     def get_tools(self) -> List[Dict[str, Any]]:
         return self.tool_executor.get_tool_descriptions()
@@ -272,29 +357,8 @@ class UnifiedAgent:
         self.tool_executor.add_tool(tool)
 
     def _register_builtin_tools(self) -> None:
-        """注册依赖 agent 自身字段的内置工具。
-
-        与 Go 版 UnifiedAgent.registerBuiltinTools 对齐：
-        rag_search 必须在 self.rag 构造之后注册，因为闭包要捕获 self.rag。
-        """
-        def _rag_search(params: Dict[str, Any]) -> str:
-            query = params.get("query", "") if isinstance(params, dict) else ""
-            if not query:
-                query = "相关内容"
-            if self.rag is None:
-                raise RuntimeError("RAG 引擎未初始化")
-            if not getattr(self.rag, "loaded", False):
-                raise RuntimeError("知识库为空，请先在「私人黑洞」上传文档")
-            answer, _ = self._run_rag_query(query)
-            return answer
-
-        self.tool_executor.add_tool(Tool(
-            name="rag_search",
-            description="从私人黑洞（个人知识库）中检索相关文档内容",
-            params=[{"name": "query", "type": "string", "description": "检索关键词或问题"}],
-            func=_rag_search,
-        ))
-        self._register_document_tools()
+        """兼容入口；Go 当前版不再把 RAG/文档领域操作注册成普通工具。"""
+        return None
 
     def _register_document_tools(self) -> None:
         for tool in [
@@ -367,8 +431,21 @@ class UnifiedAgent:
             raise RuntimeError("document library not configured")
         return store
 
+    def _document_store_call(self, method_name: str, *args):
+        """Apply tenant scoping when the repository supports ``user_id``."""
+        method = getattr(self._document_store(), method_name)
+        try:
+            supports_user = "user_id" in inspect.signature(method).parameters
+        except (TypeError, ValueError):
+            supports_user = False
+        if supports_user:
+            return method(*args, user_id=getattr(self, "user_id", "default_user"))
+        return method(*args)
+
     def write_document(self, req: WriteRequest, ingest_to_rag: bool = False) -> Dict[str, Any]:
-        wr = self._document_store().write(req)
+        # Never trust a caller-provided owner in multi-user mode.
+        req.created_by = getattr(self, "user_id", "default_user")
+        wr = self._document_store_call("write", req)
         out = _to_jsonable(wr)
         if ingest_to_rag:
             out["ingest"] = self._ingest_content(
@@ -380,18 +457,23 @@ class UnifiedAgent:
         return out
 
     def list_documents(self) -> List[Any]:
-        return self._document_store().list()
+        return self._document_store_call("list")
 
     def get_document(self, document_id: str) -> Dict[str, Any]:
-        doc, ver = self._document_store().get(document_id)
+        doc, ver = self._document_store_call("get", document_id)
         return {"document": doc, "version": ver}
+
+    def delete_document(self, document_id: str) -> None:
+        if self.rag is not None and hasattr(self.rag, "delete_document"):
+            self.rag.delete_document(document_id)
+        self._document_store_call("delete", document_id)
 
     def ingest_document(self, document_id: str, version_id: str = "") -> Dict[str, Any]:
         store = self._document_store()
         if version_id:
-            ver = store.get_version(version_id)
+            ver = self._document_store_call("get_version", version_id)
         else:
-            _, ver = store.get(document_id)
+            _, ver = self._document_store_call("get", document_id)
         doc_id = document_id or ver.document_id
         return self._ingest_content(
             ver.content_md,
@@ -403,7 +485,15 @@ class UnifiedAgent:
     def _ingest_content(self, content: str, document_id: str, version_id: str, section: str) -> Dict[str, Any]:
         if self.rag is None:
             raise RuntimeError("RAG 引擎未初始化")
-        chunk_count = self.rag.ingest(content)
+        try:
+            chunk_count = self.rag.ingest(
+                content,
+                document_id=document_id,
+                version_id=version_id,
+                section=section,
+            )
+        except TypeError:
+            chunk_count = self.rag.ingest(content)
         return {
             "chunk_count": int(chunk_count or 0),
             "document_id": document_id,
@@ -411,8 +501,11 @@ class UnifiedAgent:
             "section": section,
         }
 
-    def register_mcp_tool(self, name: str, description: str, params: List[Dict[str, str]], func):
-        self.add_tool(new_mcp_tool(name, description, params, func))
+    def register_mcp_tool(
+        self, name: str, description: str, params: List[Dict[str, str]],
+        func=None, endpoint: str = "",
+    ):
+        self.add_tool(new_mcp_tool(name, description, params, func=func, endpoint=endpoint))
 
     def rag_ingest(self, document: str) -> int:
         if self.rag is None:
@@ -432,10 +525,50 @@ class UnifiedAgent:
 
     # ── 调度主循环 ─────────────────────────────────────────────────────────
 
-    def _dispatch(self, query: str, opts: ChatOptions, token, on_event=None) -> Response:
+    def _dispatch(self, query, opts, token, on_event=None, execution_context=None):
+        from .conversations import ConversationBusy
+        # The legacy/default conversation also has a single in-flight turn.
+        lock = getattr(self, "_turn_lock", None)
+        if lock is not None and not lock.acquire(blocking=False):
+            raise ConversationBusy("当前会话仍在执行")
+        try:
+            from internal.resilience.budget import request_budget
+            with request_budget(getattr(self.cfg, "max_llm_calls_per_turn", 24),
+                                getattr(self.cfg, "max_tool_calls_per_turn", 32)):
+                return self._dispatch_once(query, opts, token, on_event, execution_context)
+        finally:
+            if lock is not None:
+                lock.release()
+
+    def _dispatch_once(
+        self,
+        query: str,
+        opts: ChatOptions,
+        token,
+        on_event=None,
+        execution_context: Optional[RequestExecutionContext] = None,
+    ) -> Response:
         """三段式编排：prepare → dispatch → finalize（与 main runOnce 对齐）。"""
-        pr = self._prepare(query, opts)
-        resp = Response(query=query, mode=pr["mode"])
+        from internal.harness.plugins import HarnessContext
+        from internal.harness.execution import start_session
+        policy = HarnessContext(session_id=getattr(self, "conversation_id", "") or "default",
+                                user_id=getattr(self, "user_id", "default_user"), query=query,
+                                plugins=getattr(self, "execution_plugins", []))
+        start_session(policy)
+        if policy.interrupted:
+            denied = Response(query=query, answer=policy.state.get("final_answer", "请求被执行策略拒绝"),
+                              interrupted=True, error=policy.interrupted_reason)
+            _emit(on_event, "done", _to_jsonable(denied))
+            return denied
+        context = execution_context or RequestExecutionContext()
+        pr = self._prepare(query, opts, context)
+        resp = Response(
+            query=query,
+            mode=pr["mode"],
+            trace_id=str(context.trace_id or uuid.uuid4()),
+            experiment_exposure_id=str(context.experiment_exposure_id or ""),
+            runtime_strategy_checksum=str(context.runtime_strategy_checksum or ""),
+        )
         resp.extracted_info = pr["extracted"]
         if resp.extracted_info:
             _emit(on_event, "memory", {"extracted_info": resp.extracted_info})
@@ -449,6 +582,9 @@ class UnifiedAgent:
 
         self._dispatch_mode(pr, resp, token, on_event)
 
+        if isinstance(resp.task, dict) and resp.task.get("status") == "interrupted":
+            resp.interrupted = True
+
         if token.is_cancelled():
             resp.interrupted = True
 
@@ -458,7 +594,12 @@ class UnifiedAgent:
 
     # ── prepare ──────────────────────────────────────────────────────────────
 
-    def _prepare(self, query: str, opts: ChatOptions) -> Dict[str, Any]:
+    def _prepare(
+        self,
+        query: str,
+        opts: ChatOptions,
+        execution_context: Optional[RequestExecutionContext] = None,
+    ) -> Dict[str, Any]:
         """STM 写入 + 偏好提取 + 路由决策 + 上下文装配 + 历史构建。"""
         self.stm.add("user", query)
         self._save_chat_history("user", query)
@@ -469,26 +610,10 @@ class UnifiedAgent:
         ph = Response(query=query)
         async_update_memory(self, query, ph)
 
-        rag_loaded = bool(self.rag and getattr(self.rag, "loaded", False))
-        if opts.explicit:
-            if opts.selected_tools:
-                route_tools = self._filter_tools(opts.selected_tools)
-                mode = "react" if need_react_from_tools(query, route_tools) else "tool"
-            elif opts.use_rag and rag_loaded:
-                mode, route_tools = "rag", None
-            else:
-                mode, route_tools = "chat", None
-        else:
-            if need_react(query):
-                mode, route_tools = "react", self.tool_executor.snapshot()
-            elif need_tool(query):
-                mode, route_tools = "tool", self.tool_executor.snapshot()
-            elif need_rag(query, rag_loaded):
-                mode, route_tools = "rag", None
-            else:
-                mode, route_tools = "chat", None
+        # 知识库请求走只读 RAG；其余请求进入统一工具执行链。
+        mode, route_tools = self._route_decide(query, opts)
 
-        mem_prefix = self._build_memory_system_prefix(query)
+        mem_prefix = self._build_context_prefix(query, mode)
         hist_msgs = self._build_history_messages(query)
 
         return {
@@ -498,7 +623,25 @@ class UnifiedAgent:
             "mem_prefix": mem_prefix,
             "hist_msgs": hist_msgs,
             "extracted": ph.extracted_info,
+            "runtime_overrides": dict(
+                (execution_context or RequestExecutionContext()).runtime_overrides
+                or {}
+            ),
         }
+
+    def _route_decide(self, query: str, opts: ChatOptions):
+        """Choose Agentic RAG, lightweight RAG, or ordinary ReAct."""
+        rag_loaded = bool(self.rag and getattr(self.rag, "loaded", False))
+        if opts.use_rag and rag_loaded:
+            if self._report_intent(query):
+                return "rag_agent", None
+            return "rag", None
+        executor = getattr(self, "tool_executor", None)
+        return "react", executor.snapshot() if executor is not None else {}
+
+    @staticmethod
+    def _report_intent(query: str) -> bool:
+        return needs_subagent_plan(query)
 
     # ── dispatch ─────────────────────────────────────────────────────────────
 
@@ -509,18 +652,41 @@ class UnifiedAgent:
         mem_prefix = pr["mem_prefix"]
         hist_msgs = pr["hist_msgs"]
         route_tools = pr["route_tools"]
+        runtime_overrides = pr.get("runtime_overrides") or {}
         resp.extracted_info = pr["extracted"]
 
         if mode == "react":
             resp.answer, resp.steps, resp.task = self._run_react_with_tools(
-                query, route_tools, mem_prefix, hist_msgs, token, on_event
+                query, route_tools, mem_prefix, hist_msgs, token, on_event,
+                allow_subagents=False,
             )
+            self._apply_graph_tool_calls(resp)
+            self._apply_structured_tool_output(resp)
+            if resp.intent is None and not any(step.type == StepType.ACTION for step in resp.steps):
+                resp.intent = "direct_chat"
+        elif mode == "rag_agent":
+            resp.answer, resp.steps, resp.task = self._run_react_with_tools(
+                query, route_tools or {}, mem_prefix, hist_msgs, token, on_event,
+                allow_subagents=True,
+                force_subagent_plan=True,
+            )
+            self._apply_graph_tool_calls(resp)
         elif mode == "tool":
             resp.answer, resp.tool_call = self._run_tool_from_set(
                 query, route_tools, mem_prefix, hist_msgs, token, on_event
             )
         elif mode == "rag":
-            resp.answer, resp.search_results = self._run_rag_query(query)
+            resp.answer, resp.search_results, resp.rag_trace = self._run_rag_query_with_trace(
+                query,
+                runtime_overrides=runtime_overrides,
+            )
+            resp.rag_trace.setdefault("trace_id", resp.trace_id)
+            if resp.runtime_strategy_checksum:
+                resp.rag_trace.setdefault(
+                    "runtime_strategy_checksum",
+                    resp.runtime_strategy_checksum,
+                )
+            _emit(on_event, "rag_trace", resp.rag_trace)
             _emit(on_event, "rag_result", {"search_results": resp.search_results})
             _emit(on_event, "token", {"content": resp.answer})
         else:
@@ -534,7 +700,10 @@ class UnifiedAgent:
         self._save_chat_history("assistant", resp.answer)
 
         # 异步：从回复中提取事实 → 长期记忆
-        self.memory_writer.submit(lambda: extract_memory_from_reply(self, resp.answer))
+        if getattr(self.cfg, "memory_store_exchange_facts", False):
+            self.memory_writer.submit(
+                lambda: extract_memory_from_reply(self, resp.answer, user_query=query)
+            )
         # 异步：长期记忆合并/淘汰（有图层时走图感知合并）
         self.memory_writer.submit(lambda: maybe_consolidate_memory(self))
 
@@ -554,11 +723,48 @@ class UnifiedAgent:
         resp.short_term_count = self.stm.count()
         resp.long_term_count = len(self.ltm.items)
         resp.preferences = self.preference.get_all()
+        self._persist_trace(query, resp)
+
+    def _persist_trace(self, query: str, resp: Response) -> None:
+        repo = getattr(getattr(self.inf, "repo", None), "ragtrace", None)
+        if repo is None or not hasattr(repo, "save"):
+            return
+        payload = sanitize_trace({
+            "trace_id": resp.trace_id,
+            "mode": resp.mode,
+            "intent": resp.intent,
+            "slots": resp.slots,
+            "rag": resp.rag_trace,
+            "steps": [asdict(step) for step in resp.steps],
+            "tool_call": resp.tool_call,
+            "tool_calls": resp.tool_calls,
+            "task": resp.task,
+            "interrupted": resp.interrupted,
+            "fallback": resp.fallback,
+            "error": resp.error,
+            "experiment_exposure_id": resp.experiment_exposure_id,
+            "runtime_strategy_checksum": resp.runtime_strategy_checksum,
+        })
+        try:
+            repo.save(
+                resp.trace_id,
+                self.user_id,
+                resp.mode,
+                redact_text(query, max_length=1000),
+                "interrupted" if resp.interrupted else "failed" if resp.error else "completed",
+                payload,
+            )
+        except Exception as exc:
+            logger.warning("⚠️  Trace 持久化失败 trace_id=%s: %s", resp.trace_id, exc)
 
     # ── Memory / Prompt 拼装 ───────────────────────────────────────────────
 
     def _llm_generate(self, system_prompt: str, user_msg: str) -> str:
         return self.llm.chat([Message(role="user", content=user_msg)], system_prompt=system_prompt)
+
+    def _llm_generate_fast(self, system_prompt: str, user_msg: str) -> str:
+        chat = getattr(self.llm, "chat_fast", None) or self.llm.chat
+        return chat([Message(role="user", content=user_msg)], system_prompt=system_prompt)
 
     def _build_prompt_context(self) -> None:
         self.task_mem = TaskMemBuffer(20)
@@ -594,7 +800,19 @@ class UnifiedAgent:
         if not hasattr(self, "prompt_assembler"):
             self._build_prompt_context()
         try:
-            return self.prompt_assembler.assemble(Query(text=query, mode=mode)).render()
+            try:
+                embedding = self.llm.embed(query)
+            except Exception:
+                embedding = []
+            current = self._cancel_registry.current_task() if hasattr(self, "_cancel_registry") else None
+            task_id = str((current or {}).get("task_id", "")) if isinstance(current, dict) else ""
+            return self.prompt_assembler.assemble(Query(
+                text=query,
+                embedding=embedding,
+                task_id=task_id,
+                mode=mode,
+                user_id=getattr(self, "user_id", ""),
+            )).render()
         except Exception as e:
             logger.warning("⚠️  promptctx 装配失败，降级到旧记忆前缀: %s", e)
             return self._build_memory_system_prefix(query)
@@ -611,11 +829,20 @@ class UnifiedAgent:
         task_id = task.get("task_id", f"task_{int(time.time())}") if isinstance(task, dict) else f"task_{int(time.time())}"
         # 持锁追加到 cancel registry（与 main taskRuntime.appendSnapshot 对齐）
         if isinstance(task, dict):
-            self._cancel_registry.append_snapshot(dict(task))
+            self._cancel_registry.append_snapshot({
+                "state": dict(task),
+                "timestamp": datetime.now().strftime("%H:%M:%S"),
+            })
         try:
-            self.inf.repo.snapshot.save(task_id, json.dumps(task, ensure_ascii=False))
+            try:
+                self.inf.repo.snapshot.save(task_id, json.dumps(task, ensure_ascii=False), user_id=self.user_id)
+            except TypeError:
+                self.inf.repo.snapshot.save(task_id, json.dumps(task, ensure_ascii=False))
         except Exception as e:
             logger.warning("⚠️  快照写入失败: %s", e)
+
+    def persist_task_checkpoint(self, task: dict) -> None:
+        self.inf.repo.snapshot.save(task['task_id'], json.dumps(task, ensure_ascii=False), user_id=self.user_id)
 
     def snapshot_list(self) -> List[dict]:
         """返回当前任务的内存快照列表（对应 main snapshotList）。"""
@@ -628,7 +855,15 @@ class UnifiedAgent:
             chat_repo = getattr(getattr(self.inf, "repo", None), "chat_history", None)
         if chat_repo is not None and hasattr(chat_repo, "save"):
             try:
-                chat_repo.save(role, content)
+                try:
+                    if getattr(self, "conversation_id", ""):
+                        chat_repo.save(role, content, user_id=self.user_id, conversation_id=self.conversation_id)
+                    else:
+                        chat_repo.save(role, content, user_id=self.user_id)
+                except TypeError:
+                    if getattr(self, "conversation_id", ""):
+                        raise  # Never spill a conversation into legacy user-wide history.
+                    chat_repo.save(role, content)
             except Exception:
                 pass
 
@@ -643,14 +878,55 @@ class UnifiedAgent:
         return "\n".join(parts)
 
     def _recent_history_for_rag(self) -> List[HistoryMessage]:
-        return [HistoryMessage(role=m["role"], content=m["content"]) for m in self.stm.get()]
+        return [HistoryMessage(role=m["role"], content=m["content"]) for m in self.stm.get()[-6:]]
 
     def _run_rag_query(self, query: str):
+        answer, results, _trace = self._run_rag_query_with_trace(query)
+        return answer, results
+
+    def _run_rag_query_with_trace(
+        self,
+        query: str,
+        *,
+        runtime_overrides: Optional[Dict[str, Any]] = None,
+    ):
         if self.rag is None:
-            return "RAG 不可用", []
+            return "RAG 不可用", [], {
+                "original_query": query,
+                "decision": "unavailable",
+                "reason": "rag_engine_unavailable",
+            }
+        if hasattr(self.rag, "query_with_history_trace"):
+            method = self.rag.query_with_history_trace
+            overrides = dict(runtime_overrides or {})
+            if overrides:
+                try:
+                    parameters = inspect.signature(method).parameters
+                except (TypeError, ValueError):
+                    parameters = {}
+                accepts_kwargs = any(
+                    parameter.kind == inspect.Parameter.VAR_KEYWORD
+                    for parameter in parameters.values()
+                )
+                if "runtime_overrides" in parameters or accepts_kwargs:
+                    return method(
+                        query,
+                        self._recent_history_for_rag(),
+                        runtime_overrides=overrides,
+                    )
+                raise RuntimeError(
+                    "RAG engine cannot apply the compiled request-scoped strategy"
+                )
+            return method(query, self._recent_history_for_rag())
         if hasattr(self.rag, "query_with_history"):
-            return self.rag.query_with_history(query, self._recent_history_for_rag())
-        return self.rag.query(query)
+            answer, results = self.rag.query_with_history(query, self._recent_history_for_rag())
+        else:
+            answer, results = self.rag.query(query)
+        return answer, results, {
+            "original_query": query,
+            "decision": "answer" if results else "no_answer",
+            "reason": "legacy_rag_engine",
+        }
 
     def _build_history_messages(self, query: str) -> List[Message]:
         msgs = [Message(role=m["role"], content=m["content"]) for m in self.stm.get()]
@@ -732,27 +1008,34 @@ class UnifiedAgent:
         params = self._parse_tool_params(tool_name, query)
         # 偏好补全：在 tool_executor.call 之前注入偏好（对应 Go 版 fillParamsFromPreference）
         self._fill_params_from_preference(params)
-        result = self.tool_executor.call(tool_name, params)
-        answer = result.content if result.success else f"工具调用失败: {result.error}"
+        from internal.agent.tool_execution import guarded_tool_attempt
+        result = guarded_tool_attempt(self, tools_map[tool_name], tool_name, params, token,
+            max(1.0, self.cfg.step_timeout_ms / 1000), f"direct:{time.time_ns()}")
+        answer = result.payload if result.success else f"工具调用失败: {result.error}"
         tool_call = {
             "tool_name": tool_name,
             "params": params,
-            "tool_result": result.content,
+            "tool_result": result.payload,
             "success": result.success,
-            "error": result.error,
+            "error": str(result.error) if result.error else None,
         }
         _emit(on_event, "tool_call", tool_call)
         if result.success:
             system_prompt = "你是一个善于综合信息的AI助手。结合你掌握的用户信息，使回答更个性化。"
             if mem_prefix:
                 system_prompt = mem_prefix + "\n\n" + system_prompt
-            user_msg = f"用户问：{query}\n工具 {tool_name} 返回结果：{result.content}\n请根据结果自然地回答用户。"
+            user_msg = f"用户问：{query}\n工具 {tool_name} 返回结果：{result.payload}\n请根据结果自然地回答用户。"
             answer = self._chat_llm(system_prompt, [Message(role="user", content=user_msg)], token, on_event)
         return answer, tool_call
 
     # ── 图调度（统一 react 入口） ──────────────────────────────────────────
 
-    def _run_react_with_tools(self, query: str, tools_map: Dict[str, Tool], mem_prefix: str, hist_msgs: List[Message], token, on_event=None):
+    def _run_react_with_tools(
+        self, query: str, tools_map: Dict[str, Tool], mem_prefix: str,
+        hist_msgs: List[Message], token, on_event=None,
+        allow_subagents: bool = False,
+        force_subagent_plan: bool = False,
+    ):
         """ReAct 模式入口：与 main 分支 runReAct 行为一致。
 
         - llm_plan_graph 拿到节点列表；
@@ -760,13 +1043,49 @@ class UnifiedAgent:
         - 节点非空 → 走 GraphRuntime 拓扑分层 + race + 重试；执行结束后用
           _generate_final_answer（对应 Go llmGenerate）合成自然语言回复。
         """
-        task = {"task_id": f"task_{int(time.time())}", "query": query, "status": "running", "steps": []}
+        task = {
+            "task_id": f"task-{time.time_ns()}", "query": query,
+            "status": "running", "phase": "planning", "steps": [],
+        }
+        task_lease = None
         self._cancel_registry.set_task(task)
         try:
-            plan_nodes = llm_plan_graph(self, query, tools_map, mem_prefix)
+            tools_map = tools_map or {}
+            if force_subagent_plan:
+                plan_nodes = subagent_pipeline_nodes(query)
+            else:
+                plan_nodes = llm_plan_graph(
+                    self, query, tools_map, mem_prefix, allow_subagents
+                )
             if not plan_nodes:
                 # 与 Go runReAct: planNodes 空 → chatLLM 一句话答复
-                return self._chat_response(mem_prefix, hist_msgs, token, on_event), [], task
+                answer = self._chat_response(mem_prefix, hist_msgs, token, on_event)
+                task.update(status="completed", phase="done", result=answer)
+                self.save_snapshot(task)
+                return answer, [], task
+
+            if any(node.tool_name == "farm_copilot" for node in plan_nodes):
+                try:
+                    from internal.application.farm_agent import detect_farm_guardrails
+
+                    for guardrail in detect_farm_guardrails(query):
+                        _emit(on_event, "guardrail", guardrail)
+                except Exception:
+                    pass
+            _emit(on_event, "plan_created", {
+                "task_id": task["task_id"],
+                "nodes": [
+                    {
+                        "id": node.id,
+                        "type": getattr(node.type, "value", str(node.type)),
+                        "tool": node.tool_name,
+                        "reason": node.name,
+                        "arguments": dict(node.params or {}),
+                        "depends_on": list(node.depends_on or []),
+                    }
+                    for node in plan_nodes
+                ],
+            })
 
             from internal.graph.task_graph import TaskGraph
 
@@ -774,44 +1093,112 @@ class UnifiedAgent:
             try:
                 graph.validate()
             except Exception:
-                for node in plan_nodes:
-                    node.depends_on = []
-                graph = TaskGraph(plan_nodes)
+                # Never remove dependencies to make an invalid plan runnable.
+                task.update(status='interrupted', phase='invalid_plan', result='执行计划依赖不合法，请重新规划')
+                self.save_snapshot(task)
+                return task['result'], [], task
+            task["phase"] = "executing"
+            task["steps"] = [
+                {
+                    "id": index, "name": node.name,
+                    "node_id": node.id,
+                    "tool_name": node.tool_name,
+                    "params": dict(node.params or {}), "status": "pending",
+                    "retry_count": 0,
+                }
+                for index, node in enumerate(graph.nodes.values(), start=1)
+            ]
+            task["current_step"] = 0
+            task["graph"] = _graph_to_contract(graph)
+            if hasattr(self, "task_mem"):
+                self.task_mem.reset()
+            self.save_snapshot(task)
+            host_workspace = prepare_artifact_workspace(self, task["task_id"])
+            if host_workspace:
+                _emit(on_event, "sandbox_ready", {"workspace": host_workspace})
             cfg = GraphConfig(
                 max_parallel=getattr(self.cfg, "graph_max_parallel", 2),
                 race_timeout_ms=getattr(self.cfg, "graph_race_timeout_ms", 30000),
                 enable_racing=getattr(self.cfg, "graph_enable_racing", True),
+                replan_enabled=getattr(self.cfg, "graph_replan_enabled", False),
+                max_replan=getattr(self.cfg, "graph_max_replan", 2),
+                replan_on_failed=getattr(self.cfg, "graph_replan_on_failed", False),
             )
-            result = GraphRuntime(graph, self, cfg, tools_map, task).execute(token)
-            steps = [
-                ReActStep(
-                    type=StepType.OBSERVATION,
-                    content=node.result or node.error,
-                    tool=node.tool_name,
-                    params=node.params,
+            runtime = GraphRuntime(graph, self, cfg, tools_map, task, on_event=on_event)
+            journal = getattr(self.inf.repo, 'action_journal', None)
+            if journal is not None:
+                from .recovery import TaskLease
+                task_lease = TaskLease(journal, self.user_id, task['task_id'])
+                task_lease.__enter__()
+                runtime._lease = task_lease
+            runtime.set_replan_context(query, mem_prefix, allow_subagents)
+            result = runtime.execute(token)
+            steps = _graph_to_react_steps(graph)
+            cancelled = bool(token is not None and callable(getattr(token, "is_cancelled", None)) and token.is_cancelled())
+            if result.interrupted or cancelled:
+                task["phase"] = "interrupted"
+                task["status"] = "interrupted"
+                summary = "; ".join(
+                    f"{node.tool_name}:{getattr(node.status, 'value', str(node.status))}" for node in graph.nodes.values()
                 )
-                for node in graph.nodes.values()
-            ]
+                return f"[已中断] {result.interrupted_msg}\n当前进度：{summary}", steps, task
+
+            task["phase"] = "generating"
             final_answer = self._generate_final_answer(query, steps, mem_prefix, token, on_event)
+            graph_failed = any(
+                getattr(node.status, "value", str(node.status)) == "failed"
+                for node in graph.nodes.values()
+            )
+            if task_lease is not None:
+                task_lease.refresh()
+            from .artifact import ArtifactExecutionBlocked
+            try:
+                artifact_step = None if graph_failed else produce_artifact(
+                    self, query, final_answer, host_workspace, on_event=on_event, token=token,
+                )
+            except ArtifactExecutionBlocked as exc:
+                task.update(status='interrupted', phase='artifact_blocked',
+                            result=final_answer + '\n\n[产物生成中断] ' + str(exc))
+                return task['result'], steps, task
+            if artifact_step is not None:
+                step = ReActStep(**artifact_step)
+                steps.append(step)
+                final_answer += "\n\n---\n" + step.content
             steps.append(ReActStep(type=StepType.FINAL_ANSWER, content=final_answer))
-            task["status"] = "interrupted" if result.interrupted else "completed"
-            task["graph"] = {
-                "nodes": [
-                    {
-                        "id": node.id,
-                        "tool": node.tool_name,
-                        "status": str(node.status),
-                        "result": node.result,
-                        "error": node.error,
-                    }
-                    for node in graph.nodes.values()
-                ]
-            }
+            if result.interrupted:
+                task["status"] = "interrupted"
+                task["phase"] = "interrupted"
+            elif graph_failed:
+                task["status"] = "failed"
+                task["phase"] = "failed"
+            else:
+                task["status"] = "completed"
+                task["phase"] = "done"
+            task["result"] = final_answer
+            task["graph"] = _graph_to_contract(graph)
             return final_answer, steps, task
         finally:
-            self._cancel_registry.set_task(None)
+            # Go 版保留最近任务及快照供 /api/snapshots 和恢复接口读取。
+            try:
+                if task.get('recovery'):
+                    if task_lease is not None:
+                        task_lease.refresh()
+                    self.persist_task_checkpoint(task)
+            finally:
+                if task_lease is not None and hasattr(task_lease, 'worker'):
+                    task_lease.__exit__(None, None, None)
 
     def _generate_final_answer(self, query: str, steps: List[ReActStep], mem_prefix: str, token=None, on_event=None) -> str:
+        # Domain tools return an auditable deterministic answer.  In Mock mode
+        # present that verified answer instead of wrapping the JSON in a fake
+        # LLM/typewriter response.
+        if not self.cfg.is_real_llm():
+            structured = _latest_structured_tool_result(steps)
+            if structured is not None:
+                answer = str(structured.get("answer") or "").strip()
+                if answer:
+                    _emit(on_event, "token", {"content": answer})
+                    return answer
         steps_str = "\n".join(f"{s.type}: {s.content}" for s in steps)
         prompt = f"""基于以下推理过程，给出最终答案。
 
@@ -828,6 +1215,57 @@ class UnifiedAgent:
         messages = [Message(role="user", content=prompt)]
         return self._chat_llm("你是一个总结助手，能够基于推理过程给出简洁的最终答案。", messages, token, on_event)
 
+    @staticmethod
+    def _apply_graph_tool_calls(resp: Response) -> None:
+        task = resp.task if isinstance(resp.task, dict) else {}
+        graph = task.get("graph") if isinstance(task, dict) else None
+        nodes = graph.get("nodes") if isinstance(graph, dict) else None
+        if not isinstance(nodes, dict):
+            return
+        calls: List[Dict[str, Any]] = []
+        for node in nodes.values():
+            if not isinstance(node, dict) or not node.get("tool_name"):
+                continue
+            status = str(node.get("status") or "").lower()
+            result = node.get("result") or ""
+            success = status == "done"
+            try:
+                result_payload = json.loads(result) if isinstance(result, str) else result
+                if isinstance(result_payload, dict) and result_payload.get("ok") is False:
+                    success = False
+            except json.JSONDecodeError:
+                pass
+            calls.append({
+                "tool_name": str(node.get("tool_name")),
+                "params": dict(node.get("params") or {}),
+                "tool_result": result,
+                "success": success,
+                "error": str(node.get("error") or "") or None,
+            })
+        resp.tool_calls = calls
+        if len(calls) == 1:
+            resp.tool_call = dict(calls[0])
+
+    @staticmethod
+    def _apply_structured_tool_output(resp: Response) -> None:
+        structured = _latest_structured_tool_result(resp.steps)
+        if structured is None:
+            return
+        intent = str(structured.get("intent") or "").strip()
+        evidence = structured.get("evidence")
+        slots = evidence.get("slots") if isinstance(evidence, dict) else None
+        if intent:
+            resp.intent = intent
+        if isinstance(slots, dict):
+            resp.slots = dict(slots)
+        if structured.get("ok") is False:
+            resp.fallback = True
+            error = structured.get("error")
+            if isinstance(error, dict):
+                resp.error = str(error.get("message") or error.get("code") or "工具执行失败")
+            else:
+                resp.error = str(error or "工具执行失败")
+
     def _save_agent_snapshot(self, query: str, resp: Response):
         """每 N 轮把 agent 整体状态序列化到 PG（含路由 mode/计数/偏好）。"""
         snapshot = {
@@ -840,7 +1278,10 @@ class UnifiedAgent:
             "timestamp": time.time(),
         }
         try:
-            self.inf.repo.snapshot.save(snapshot["task_id"], json.dumps(snapshot, ensure_ascii=False))
+            try:
+                self.inf.repo.snapshot.save(snapshot["task_id"], json.dumps(snapshot, ensure_ascii=False), user_id=self.user_id)
+            except TypeError:
+                self.inf.repo.snapshot.save(snapshot["task_id"], json.dumps(snapshot, ensure_ascii=False))
         except Exception as e:
             logger.warning("⚠️  agent 快照写入失败: %s", e)
 
@@ -880,6 +1321,88 @@ def _param_bool(params: Dict[str, Any], key: str) -> bool:
 
 def _json_string(value: Any) -> str:
     return json.dumps(_to_jsonable(value), ensure_ascii=False, indent=2)
+
+
+def _latest_structured_tool_result(steps: List[ReActStep]) -> Optional[Dict[str, Any]]:
+    for step in reversed(steps or []):
+        if step.type != StepType.OBSERVATION:
+            continue
+        try:
+            payload = json.loads(step.content or "")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        evidence = payload.get("evidence")
+        if (
+            isinstance(evidence, dict)
+            and evidence.get("tool") == "farm_copilot"
+            and payload.get("intent")
+            and "answer" in payload
+        ):
+            return payload
+    return None
+
+
+def _graph_to_contract(graph) -> Dict[str, Any]:
+    nodes: Dict[str, Any] = {}
+    for node_id, node in graph.nodes.items():
+        is_subagent = getattr(node.type, "value", node.type) == "sub_agent"
+        item = {
+            "id": node.id,
+            "type": getattr(node.type, "value", str(node.type)),
+            "name": node.name,
+            "params": dict(node.params or {}),
+            "depends_on": list(node.depends_on or []),
+            "optional_depends_on": list(node.optional_depends_on or []),
+            "status": getattr(node.status, "value", str(node.status)),
+            "retry_count": node.retry_count,
+        }
+        if is_subagent:
+            item["agent_name"] = node.tool_name
+            item["goal"] = str((node.params or {}).get("goal") or "")
+        else:
+            item["tool_name"] = node.tool_name
+        if node.race_group:
+            item["race_group"] = node.race_group
+        if node.result:
+            item["result"] = node.result
+        if node.error:
+            item["error"] = node.error
+        nodes[node_id] = item
+    return {
+        "nodes": nodes,
+        "adj_list": {key: list(value) for key, value in graph.adj.items()},
+        "in_degree": dict(graph.indegree),
+    }
+
+
+def _graph_to_react_steps(graph) -> List[ReActStep]:
+    steps: List[ReActStep] = []
+    for node_id in sorted(graph.nodes):
+        node = graph.nodes[node_id]
+        steps.append(ReActStep(type=StepType.THOUGHT, content=node.name))
+        steps.append(ReActStep(
+            type=StepType.ACTION,
+            content=f"调用 {node.tool_name}",
+            tool=node.tool_name,
+            params=dict(node.params or {}),
+        ))
+        status = getattr(node.status, "value", str(node.status))
+        if status == "done":
+            content = node.result
+        elif status == "failed":
+            # A semantic-failure envelope contains the safe user-facing answer
+            # and evidence.  Keep it available to the response/adapter layer.
+            content = node.result or f"执行失败: {node.error}"
+        elif status == "skipped":
+            content = "[竞速跳过] 其他节点已胜出"
+        elif status == "cancelled":
+            content = "[已中断]"
+        else:
+            continue
+        steps.append(ReActStep(type=StepType.OBSERVATION, content=content))
+    return steps
 
 
 def _emit(on_event, event_type: str, data: Any) -> None:

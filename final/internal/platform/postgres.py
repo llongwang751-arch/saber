@@ -37,6 +37,9 @@ _DDLS: List[str] = [
         content    TEXT NOT NULL,
         created_at TIMESTAMP DEFAULT NOW()
     )""",
+    "ALTER TABLE chat_history ADD COLUMN IF NOT EXISTS user_id TEXT NOT NULL DEFAULT 'legacy'",
+    "ALTER TABLE chat_history ADD COLUMN IF NOT EXISTS conversation_id TEXT NOT NULL DEFAULT ''",
+    "CREATE INDEX IF NOT EXISTS ix_chat_history_conversation ON chat_history(user_id, conversation_id, id)",
     """CREATE TABLE IF NOT EXISTS long_term_memory (
         id            SERIAL PRIMARY KEY,
         content       TEXT NOT NULL,
@@ -56,17 +59,56 @@ _DDLS: List[str] = [
     "ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS tags          JSONB NOT NULL DEFAULT '[]'::jsonb",
     "ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS slot_hint     VARCHAR(64) NOT NULL DEFAULT ''",
     "ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS score         DOUBLE PRECISION NOT NULL DEFAULT 0.0",
+    "ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS user_id       TEXT NOT NULL DEFAULT 'legacy'",
+    "ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS status        VARCHAR(32) NOT NULL DEFAULT 'active'",
+    "ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS superseded_by BIGINT",
+    "ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS quarantine_reason TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 1",
+    "ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+    "ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ",
+    "ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS content_hash TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS embedding_model TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS embedding_revision TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS superseded_at TIMESTAMPTZ",
+    "ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS supersedes JSONB NOT NULL DEFAULT '[]'::jsonb",
+    "CREATE INDEX IF NOT EXISTS idx_ltm_active_user_id ON long_term_memory(user_id, id) WHERE deleted_at IS NULL",
+    """CREATE TABLE IF NOT EXISTS memory_outbox (
+        id BIGSERIAL PRIMARY KEY, event_id UUID NOT NULL UNIQUE,
+        aggregate_id BIGINT NOT NULL, user_id TEXT NOT NULL,
+        aggregate_version BIGINT NOT NULL, event_type TEXT NOT NULL,
+        target TEXT NOT NULL, payload JSONB NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending', attempts INT NOT NULL DEFAULT 0,
+        available_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), locked_at TIMESTAMPTZ,
+        locked_by TEXT, processed_at TIMESTAMPTZ, last_error TEXT,
+        repair_dedupe_key TEXT UNIQUE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        CONSTRAINT memory_outbox_status_check CHECK (status IN ('pending','processing','processed','dead')),
+        CONSTRAINT memory_outbox_target_check CHECK (target IN ('milvus','neo4j','ltm_cache'))
+    )""",
+    "ALTER TABLE task_snapshots ADD COLUMN IF NOT EXISTS user_id TEXT NOT NULL DEFAULT 'legacy'",
+    "CREATE INDEX IF NOT EXISTS idx_snapshots_user ON task_snapshots(user_id, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_memory_outbox_ready ON memory_outbox(target, available_at, id) WHERE status = 'pending'",
+    "CREATE INDEX IF NOT EXISTS idx_memory_outbox_stale_lock ON memory_outbox(target, locked_at) WHERE status = 'processing'",
+    "CREATE INDEX IF NOT EXISTS idx_memory_outbox_aggregate ON memory_outbox(aggregate_id, aggregate_version)",
     "CREATE INDEX IF NOT EXISTS idx_lti_category ON long_term_memory(category)",
     "CREATE INDEX IF NOT EXISTS idx_lti_tags     ON long_term_memory USING GIN(tags)",
     """CREATE TABLE IF NOT EXISTS rag_chunks (
         id          BIGSERIAL PRIMARY KEY,
+        user_id     TEXT NOT NULL DEFAULT 'default_user',
         doc_hash    TEXT NOT NULL,
         chunk_idx   INT NOT NULL,
         content     TEXT NOT NULL,
         embedding   JSONB,
-        created_at  TIMESTAMP DEFAULT NOW(),
-        UNIQUE(doc_hash, chunk_idx)
+        created_at  TIMESTAMP DEFAULT NOW()
     )""",
+    "ALTER TABLE rag_chunks ADD COLUMN IF NOT EXISTS parent_content TEXT",
+    "ALTER TABLE rag_chunks ADD COLUMN IF NOT EXISTS document_id TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE rag_chunks ADD COLUMN IF NOT EXISTS version_id TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE rag_chunks ADD COLUMN IF NOT EXISTS section TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE rag_chunks ADD COLUMN IF NOT EXISTS user_id TEXT NOT NULL DEFAULT 'default_user'",
+    "ALTER TABLE rag_chunks DROP CONSTRAINT IF EXISTS rag_chunks_doc_hash_chunk_idx_key",
+    "DROP INDEX IF EXISTS rag_chunks_doc_hash_chunk_idx_key",
+    "CREATE UNIQUE INDEX IF NOT EXISTS rag_chunks_user_doc_hash_chunk_idx_key ON rag_chunks(user_id, doc_hash, chunk_idx)",
+    "CREATE INDEX IF NOT EXISTS idx_rag_chunks_user_id ON rag_chunks(user_id, id)",
 ]
 
 
@@ -79,7 +121,7 @@ class PostgresClient:
         self._pool = None
         self.status: str = "disconnected"
         self._connect()
-        if self._conn is not None:
+        if self.is_real():
             self.bootstrap_schema()
 
     # ─── 连接 ───
@@ -103,7 +145,7 @@ class PostgresClient:
             self._pool.putconn(self._conn)
             self._conn = None
             self.status = "connected"
-            logger.info("✅ PostgreSQL 连接池已连接: %s (min=5 max=25)", self.cfg.pg_dsn())
+            logger.info("✅ PostgreSQL 连接池已连接 (min=5 max=25)")
         except Exception as e:
             logger.warning("⚠️  PostgreSQL 连接失败: %s", e)
             self._conn = None

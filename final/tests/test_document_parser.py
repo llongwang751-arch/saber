@@ -25,3 +25,18 @@ def test_parse_plain_text_removes_nul_characters():
 def test_parse_empty_text_rejects_document():
     with pytest.raises(ValueError, match="empty"):
         parse_bytes("empty.txt", "text/plain", b"   ")
+
+
+def test_format_table_to_markdown():
+    from internal.document.parser import _format_table_to_markdown
+
+    table_data = [
+        ["指标", "数值", "说明"],
+        ["准确率", "98.5%", "基准测试"],
+        ["时延", "1.2ms", "SQLite FTS5"],
+    ]
+    md = _format_table_to_markdown(table_data)
+    assert "| 指标 | 数值 | 说明 |" in md
+    assert "| --- | --- | --- |" in md
+    assert "| 准确率 | 98.5% | 基准测试 |" in md
+    assert "| 时延 | 1.2ms | SQLite FTS5 |" in md

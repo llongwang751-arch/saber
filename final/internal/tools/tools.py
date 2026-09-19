@@ -1,22 +1,61 @@
 # tools — 工具定义、调用与注册（Python 版与 main 分支 Go 版 tools.go 对齐）
 #
-# 内置工具集合（与 Go 版 toolimpl.DefaultTools 对齐）：get_time / get_weather / search_web。
-# 注意 rag_search 不在此处注册——它依赖 Agent 持有的 RAG 引擎实例，
-# 由 internal/agent/agent.py 的 _register_builtin_tools 在 agent 启动期动态注入闭包。
+# 内置工具集合与 Go 845e8f7 的 toolimpl.DefaultTools 对齐：默认仅 search_web。
+# get_time/get_weather 保留为可选工具函数，但不自动注册；RAG 与文档库是领域链路，
+# 不伪装成普通内置工具。
 #
 # 此外提供以下能力：
 #   - exec_command：通过 sandbox 在隔离环境执行终端命令
 #   - tavily：调用 Tavily Search API（search_web 双层降级：tavily → LLM → mock）
 #   - decide：基于关键字的简单工具选择器（对应 Go 版 tools.Decide）
+import ipaddress
+import json
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
+from urllib.parse import urlparse
 
 import requests
 
 logger = logging.getLogger(__name__)
+
+MCP_DEFAULT_TIMEOUT_SECONDS = 30
+# 本地开发/内网部署时可显式放开对私网 MCP 端点的限制。
+ALLOW_PRIVATE_MCP_ENV = "AGI_ALLOW_PRIVATE_MCP_ENDPOINTS"
+
+
+def validate_mcp_endpoint(endpoint: str) -> None:
+    """SSRF 防护：MCP 端点只允许 http(s)，且默认拒绝指向内网/回环/链路本地地址。
+
+    只校验 IP 字面量；域名解析后的指向由部署层网络策略负责。
+    """
+    parsed = urlparse(endpoint)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"MCP endpoint 必须是 http/https URL: {endpoint!r}")
+    host = parsed.hostname or ""
+    if not host:
+        raise ValueError("MCP endpoint 缺少主机名")
+    if os.getenv(ALLOW_PRIVATE_MCP_ENV, "").strip().lower() in {"1", "true", "yes", "on"}:
+        return
+    try:
+        ip = ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        return
+    if (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+        or ip.is_unspecified
+    ):
+        raise ValueError(
+            f"为防止 SSRF，MCP endpoint 不允许指向内网地址: {endpoint!r}"
+            f"（确需内网端点可设置 {ALLOW_PRIVATE_MCP_ENV}=1）"
+        )
 
 
 # ─────────────────────────────── 数据结构 ────────────────────────────────────
@@ -28,6 +67,152 @@ class Tool:
     params: List[Dict[str, str]]
     func: Callable[[Dict[str, Any]], str]
     is_mcp: bool = False
+    # Optional deterministic router used by the no-LLM planner.  Tools without
+    # a matcher are never called merely because they were registered.
+    matcher: Optional[Callable[[str], bool]] = None
+    # Go Tool.ExecuteCtx / ExecuteStructured 的 Python 对应物。参数顺序追加在
+    # 末尾，保持现有 Tool(name, description, params, func, ...) 调用兼容。
+    execute_ctx: Optional[Callable[["ToolCallContext", Dict[str, Any]], str]] = None
+    execute_structured: Optional[
+        Callable[["ToolCallContext", Dict[str, Any]], "ToolResult"]
+    ] = None
+    # Unclassified external tools are conservatively treated as writes.
+    side_effecting: bool = False
+    idempotent: bool = False
+    requires_approval: bool = False
+
+
+class ToolError(Exception):
+    """可供调度器可靠判定重试语义的结构化工具错误。"""
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        retryable: bool = False,
+        cause: Optional[BaseException] = None,
+    ):
+        self.code = str(code or "internal")
+        self.message = str(message or "工具执行失败")
+        self.retryable = bool(retryable)
+        self.cause = cause
+        super().__init__(self.message)
+
+    def __str__(self) -> str:
+        return f"{self.code}: {self.message}" if self.code else self.message
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "code": self.code,
+            "message": self.message,
+            "retryable": self.retryable,
+        }
+
+
+@dataclass
+class ToolResult:
+    """与 Go ToolResult 对齐的结构化调用结果；duration 单位为秒。"""
+
+    success: bool
+    payload: str = ""
+    payload_json: Optional[Dict[str, Any]] = None
+    error: Optional[ToolError] = None
+    duration: float = 0.0
+    metadata: Dict[str, str] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
+            "success": self.success,
+            "payload": self.payload,
+            "duration": self.duration,
+            "metadata": dict(self.metadata),
+        }
+        if self.payload_json is not None:
+            result["payload_json"] = self.payload_json
+        if self.error is not None:
+            result["error"] = self.error.to_dict()
+        return result
+
+
+class ToolCallContext:
+    """协作式取消/截止时间上下文。
+
+    Python 线程不能强杀已经进入第三方阻塞函数的调用。此对象让支持上下文的
+    工具在调用前后检查取消，并把剩余截止时间传给网络客户端；GraphRuntime
+    仍可及时停止等待不支持上下文的旧工具，但其后台调用可能继续到自身返回。
+    """
+
+    def __init__(self, token: Any = None, timeout_seconds: float = 0.0):
+        self.token = token
+        timeout = max(0.0, float(timeout_seconds or 0.0))
+        self._timeout_seconds = timeout
+        self.deadline = time.monotonic() + timeout if timeout > 0 else None
+
+    def is_cancelled(self) -> bool:
+        return bool(
+            self.token is not None
+            and callable(getattr(self.token, "is_cancelled", None))
+            and self.token.is_cancelled()
+        )
+
+    def is_timed_out(self) -> bool:
+        return self.deadline is not None and time.monotonic() >= self.deadline
+
+    def remaining_seconds(self, default: float = MCP_DEFAULT_TIMEOUT_SECONDS) -> float:
+        if self.deadline is None:
+            return float(default)
+        # Subtracting a large monotonic timestamp may round above the original
+        # timeout; never pass a larger budget to the downstream HTTP client.
+        return min(self._timeout_seconds, max(0.001, self.deadline - time.monotonic()))
+
+    def failure(self) -> Optional[ToolError]:
+        if self.is_cancelled():
+            return ToolError("cancelled", "工具调用被用户中断", retryable=False)
+        if self.is_timed_out():
+            return ToolError("timeout", "工具调用超过截止时间", retryable=True)
+        return None
+
+
+def classify_tool_exception(
+    exc: BaseException, *, default_retryable: bool = False
+) -> ToolError:
+    """把 Python/requests 异常转换成稳定的 Go 风格重试分类。"""
+    if isinstance(exc, ToolError):
+        return exc
+    if isinstance(exc, requests.HTTPError):
+        response = getattr(exc, "response", None)
+        status = int(getattr(response, "status_code", 0) or 0)
+        if status >= 500:
+            return ToolError("http_5xx", f"HTTP 返回 {status}", retryable=True, cause=exc)
+        if status >= 400:
+            return ToolError("http_4xx", f"HTTP 返回 {status}", retryable=False, cause=exc)
+    invalid_request_types = tuple(
+        error_type
+        for error_type in (
+            getattr(requests, "InvalidURL", None),
+            getattr(requests, "MissingSchema", None),
+            getattr(requests, "InvalidSchema", None),
+            getattr(requests.exceptions, "InvalidJSONError", None),
+        )
+        if isinstance(error_type, type)
+    )
+    if invalid_request_types and isinstance(exc, invalid_request_types):
+        return ToolError("param", str(exc) or "MCP 请求参数错误", retryable=False, cause=exc)
+    if isinstance(exc, (TimeoutError, requests.Timeout)):
+        return ToolError("timeout", str(exc) or "工具调用超时", retryable=True, cause=exc)
+    if isinstance(exc, requests.ConnectionError):
+        return ToolError("network", str(exc) or "网络连接失败", retryable=True, cause=exc)
+    if isinstance(exc, requests.RequestException):
+        return ToolError("network", str(exc) or "网络请求失败", retryable=True, cause=exc)
+    if isinstance(exc, (TypeError, ValueError)):
+        return ToolError("param", str(exc) or "工具参数错误", retryable=False, cause=exc)
+    if isinstance(exc, (InterruptedError, KeyboardInterrupt)):
+        return ToolError("cancelled", str(exc) or "工具调用被中断", retryable=False, cause=exc)
+    return ToolError(
+        "internal", str(exc) or exc.__class__.__name__,
+        retryable=default_retryable, cause=exc,
+    )
 
 
 @dataclass
@@ -38,6 +223,7 @@ class CallResult:
     # 兼容 Go 版 CallResult 字段（部分调用方期望）
     tool_name: str = ""
     params: Dict[str, Any] = field(default_factory=dict)
+    structured_result: Optional[ToolResult] = None
 
 
 # ─────────────────────────────── 内置工具 ────────────────────────────────────
@@ -180,6 +366,8 @@ def build_exec_command_tool(sandbox) -> Optional[Tool]:
             {"name": "confirm", "type": "boolean", "description": "对 warn 级命令的二次确认；默认 false"},
         ],
         func=exec_command_tool_factory(sandbox),
+        side_effecting=True,
+        requires_approval=True,
     )
 
 
@@ -193,22 +381,12 @@ def default_tools(cfg=None, llm=None, sandbox=None) -> List[Tool]:
         llm:     LLM 客户端（提供 chat 方法）。用于 search_web 的 LLM 降级。
         sandbox: sandbox.Sandbox 实例。提供后会自动注册 exec_command 工具。
 
-    返回的 Tool 列表包含：get_time / get_weather / search_web；
-    并在条件满足时追加 tavily 与 exec_command。
-
-    注意：rag_search 不在默认工具集中，因为它依赖 Agent 的 RAG 引擎实例，
-    由 internal/agent/agent.py 的 _register_builtin_tools 在 agent 启动期动态注入。
+    与 Go 当前版严格对齐：默认只暴露 ``search_web``。时间、天气、RAG 和
+    文档库都不是普通内置工具；``exec_command`` 仅在沙箱成功初始化后注册。
     """
     search_func = search_web_factory(cfg=cfg, llm=llm) if (cfg is not None or llm is not None) else search_web
 
     tools: List[Tool] = [
-        Tool(name="get_time", description="获取当前系统时间", params=[], func=get_time),
-        Tool(
-            name="get_weather",
-            description="获取指定城市的天气信息",
-            params=[{"name": "city", "type": "string", "description": "城市名称"}],
-            func=get_weather,
-        ),
         Tool(
             name="search_web",
             description="执行网络搜索（Tavily → LLM 知识库 → mock 三层降级）",
@@ -216,10 +394,6 @@ def default_tools(cfg=None, llm=None, sandbox=None) -> List[Tool]:
             func=search_func,
         ),
     ]
-
-    # 配置了 search_api_key 时额外暴露独立的 tavily 工具
-    if cfg is not None and getattr(cfg, "search_api_key", ""):
-        tools.append(build_tavily_tool(cfg))
 
     # sandbox 可用时注册 exec_command
     if sandbox is not None:
@@ -259,6 +433,27 @@ class ToolExecutor:
                 tool_name=tool_name, params=args or {},
             )
         try:
+            if callable(tool.execute_structured):
+                structured = tool.execute_structured(
+                    ToolCallContext(timeout_seconds=MCP_DEFAULT_TIMEOUT_SECONDS),
+                    args or {},
+                )
+                if not structured.success:
+                    return CallResult(
+                        success=False,
+                        content=structured.payload,
+                        error=str(structured.error or "工具执行失败"),
+                        tool_name=tool_name,
+                        params=args or {},
+                        structured_result=structured,
+                    )
+                return CallResult(
+                    success=True,
+                    content=structured.payload,
+                    tool_name=tool_name,
+                    params=args or {},
+                    structured_result=structured,
+                )
             result = tool.func(args or {})
             return CallResult(success=True, content=str(result), tool_name=tool_name, params=args or {})
         except Exception as e:
@@ -296,6 +491,15 @@ class ToolExecutor:
                 # 覆盖既有同名工具：保持 self.tools 唯一性
                 self.tools = [t for t in self.tools if t.name != tool.name]
             self.tools.append(tool)
+
+    def remove_tool(self, name: str) -> bool:
+        """Remove a dynamically registered tool without mutating built-ins."""
+        with self._lock:
+            if name not in self._tool_map:
+                return False
+            self._tool_map.pop(name, None)
+            self.tools = [tool for tool in self.tools if tool.name != name]
+            return True
 
     def snapshot(self) -> Dict[str, Tool]:
         """返回 _tool_map 的浅拷贝，供调用方无锁遍历（对应 main snapshot）。"""
@@ -362,27 +566,187 @@ def new_mcp_tool(
     func: Optional[Callable[[Dict[str, Any]], str]] = None,
     endpoint: str = "",
 ) -> Tool:
-    """创建 MCP 工具：
+    """创建带 Go 等价结构化结果和错误分类的 MCP 工具。
 
-    若提供 func 则直接使用（兼容旧调用）；否则当 endpoint 非空时构造 HTTP POST 调用器
-    （对应 Go 版 NewMCPTool 行为）。
+    ``func`` 仍作为字符串版兼容入口；``execute_structured`` 供 GraphRuntime
+    优先调用。HTTP 4xx/参数/取消不可重试，5xx/网络/超时可重试。
     """
+    structured: Callable[[ToolCallContext, Dict[str, Any]], ToolResult]
+
+    if endpoint:
+        validate_mcp_endpoint(endpoint)
+
     if func is None and endpoint:
-        def _http_call(p: Dict[str, Any]) -> str:
+        def _http_structured(ctx: ToolCallContext, p: Dict[str, Any]) -> ToolResult:
+            started = time.perf_counter()
+            metadata = {"backend": "mcp", "endpoint": endpoint}
+            early_failure = ctx.failure()
+            if early_failure is not None:
+                return ToolResult(
+                    success=False, error=early_failure,
+                    duration=time.perf_counter() - started, metadata=metadata,
+                )
+
             try:
-                resp = requests.post(endpoint, json=p, timeout=30)
-            except requests.RequestException as e:
-                raise RuntimeError(f"MCP 请求失败 [{endpoint}]: {e}") from e
-            if resp.status_code >= 400:
-                raise RuntimeError(f"MCP 返回错误状态 {resp.status_code} [{endpoint}]")
-            return resp.text
+                # requests 会自行编码 JSON；这里先验证一次，使序列化失败稳定归类为 param。
+                json.dumps(p)
+            except Exception as exc:
+                error = ToolError(
+                    "param", f"序列化参数失败: {exc}", retryable=False, cause=exc
+                )
+                return ToolResult(
+                    success=False, error=error,
+                    duration=time.perf_counter() - started, metadata=metadata,
+                )
+
+            try:
+                timeout = ctx.remaining_seconds(MCP_DEFAULT_TIMEOUT_SECONDS)
+                # 没有显式 deadline 时保留整数 30，兼容旧调用及 requests 合同。
+                request_timeout = (
+                    MCP_DEFAULT_TIMEOUT_SECONDS if ctx.deadline is None else timeout
+                )
+                response = requests.post(endpoint, json=p, timeout=request_timeout)
+            except requests.Timeout as exc:
+                context_failure = ctx.failure()
+                error = context_failure or ToolError(
+                    "timeout", f"MCP 请求超时 [{endpoint}]", retryable=True, cause=exc
+                )
+                return ToolResult(
+                    success=False, error=error,
+                    duration=time.perf_counter() - started, metadata=metadata,
+                )
+            except requests.RequestException as exc:
+                context_failure = ctx.failure()
+                error = context_failure or classify_tool_exception(
+                    exc, default_retryable=True
+                )
+                return ToolResult(
+                    success=False, error=error,
+                    duration=time.perf_counter() - started, metadata=metadata,
+                )
+            except Exception as exc:
+                error = ctx.failure() or classify_tool_exception(
+                    exc, default_retryable=False
+                )
+                return ToolResult(
+                    success=False, error=error,
+                    duration=time.perf_counter() - started, metadata=metadata,
+                )
+
+            metadata["status_code"] = str(response.status_code)
+            try:
+                payload = str(getattr(response, "text", ""))
+            except Exception as exc:
+                error = ToolError(
+                    "network", f"读取 MCP 响应失败: {exc}",
+                    retryable=True, cause=exc,
+                )
+                return ToolResult(
+                    success=False, error=error,
+                    duration=time.perf_counter() - started, metadata=metadata,
+                )
+            context_failure = ctx.failure()
+            if context_failure is not None:
+                return ToolResult(
+                    success=False, payload=payload, error=context_failure,
+                    duration=time.perf_counter() - started, metadata=metadata,
+                )
+
+            if response.status_code >= 400:
+                is_server_error = response.status_code >= 500
+                error = ToolError(
+                    "http_5xx" if is_server_error else "http_4xx",
+                    f"MCP 返回 {response.status_code}",
+                    retryable=is_server_error,
+                )
+                return ToolResult(
+                    success=False, payload=payload, error=error,
+                    duration=time.perf_counter() - started, metadata=metadata,
+                )
+
+            payload_json = None
+            try:
+                candidate = json.loads(payload)
+                if isinstance(candidate, dict):
+                    payload_json = candidate
+            except (TypeError, json.JSONDecodeError):
+                pass
+            return ToolResult(
+                success=True, payload=payload, payload_json=payload_json,
+                duration=time.perf_counter() - started, metadata=metadata,
+            )
+
+        structured = _http_structured
+
+        def _http_call(p: Dict[str, Any]) -> str:
+            result = structured(ToolCallContext(), p)
+            if not result.success:
+                raise result.error or ToolError("internal", "MCP 请求失败")
+            return result.payload
 
         func = _http_call
+    else:
+        if func is None:
+            def _noop(_p: Dict[str, Any]) -> str:
+                return f"[MCP] {name} 未配置 func 或 endpoint"
 
-    if func is None:
-        def _noop(_p: Dict[str, Any]) -> str:
-            return f"[MCP] {name} 未配置 func 或 endpoint"
+            func = _noop
 
-        func = _noop
+        compatible_func = func
 
-    return Tool(name=name, description=description, params=params, func=func, is_mcp=True)
+        def _custom_structured(ctx: ToolCallContext, p: Dict[str, Any]) -> ToolResult:
+            started = time.perf_counter()
+            metadata = {"backend": "mcp"}
+            if endpoint:
+                metadata["endpoint"] = endpoint
+            early_failure = ctx.failure()
+            if early_failure is not None:
+                return ToolResult(
+                    success=False, error=early_failure,
+                    duration=time.perf_counter() - started, metadata=metadata,
+                )
+            try:
+                payload = str(compatible_func(p))
+            except Exception as exc:
+                error = classify_tool_exception(exc, default_retryable=False)
+                return ToolResult(
+                    success=False, error=error,
+                    duration=time.perf_counter() - started, metadata=metadata,
+                )
+            context_failure = ctx.failure()
+            if context_failure is not None:
+                return ToolResult(
+                    success=False, payload=payload, error=context_failure,
+                    duration=time.perf_counter() - started, metadata=metadata,
+                )
+            payload_json = None
+            try:
+                candidate = json.loads(payload)
+                if isinstance(candidate, dict):
+                    payload_json = candidate
+            except (TypeError, json.JSONDecodeError):
+                pass
+            return ToolResult(
+                success=True, payload=payload, payload_json=payload_json,
+                duration=time.perf_counter() - started, metadata=metadata,
+            )
+
+        structured = _custom_structured
+
+    def _execute_ctx(ctx: ToolCallContext, p: Dict[str, Any]) -> str:
+        result = structured(ctx, p)
+        if not result.success:
+            raise result.error or ToolError("internal", "MCP 请求失败")
+        return result.payload
+
+    return Tool(
+        name=name,
+        description=description,
+        params=params,
+        func=func,
+        is_mcp=True,
+        side_effecting=True,
+        requires_approval=True,
+        execute_ctx=_execute_ctx,
+        execute_structured=structured,
+    )

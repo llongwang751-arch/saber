@@ -70,6 +70,7 @@ def _agent(**overrides):
         chat_repo=None,
         rag=None,
         llm=None,
+        user_id="user-a",
         kg=None,
         graph_memory=None,
     )
@@ -165,9 +166,10 @@ def test_init_knowledge_graph_three_step_attach(monkeypatch):
     fake_kg = types.ModuleType("internal.graph.kgstore")
 
     class _KGStore:
-        def __init__(self, cfg, client, llm_fn=None):
+        def __init__(self, cfg, client, llm_fn=None, *, user_id):
             captured["kg_client"] = client
             captured["kg_llm_fn"] = llm_fn
+            captured["kg_user_id"] = user_id
             self.cfg = cfg
 
     fake_kg.KGStore = _KGStore
@@ -175,11 +177,14 @@ def test_init_knowledge_graph_three_step_attach(monkeypatch):
     fake_gm_mod = types.ModuleType("internal.memory.graph_memory")
 
     class _GraphMemory:
-        def __init__(self, cfg, client, llm=None, sim_threshold=0.7, ltm=None):
+        def __init__(
+            self, cfg, client, llm=None, sim_threshold=0.7, ltm=None, *, user_id
+        ):
             captured["gm_client"] = client
             captured["gm_ltm"] = ltm
             captured["gm_sim"] = sim_threshold
             captured["gm_llm"] = llm
+            captured["gm_user_id"] = user_id
             self.ltm = ltm
             self._sync_called = False
 
@@ -212,6 +217,8 @@ def test_init_knowledge_graph_three_step_attach(monkeypatch):
     # 1) KGStore 与 GraphMemory 复用同一个 Neo4j client
     assert captured["kg_client"] is captured["gm_client"]
     assert isinstance(captured["kg_client"], _Client)
+    assert captured["kg_user_id"] == "user-a"
+    assert captured["gm_user_id"] == "user-a"
 
     # 2) KGStore 注入到 RAG
     assert isinstance(rag.kg_store, _KGStore)
@@ -244,13 +251,18 @@ def test_init_knowledge_graph_no_ltm(monkeypatch):
     fake_neo.Neo4jClient = _Client
 
     fake_kg = types.ModuleType("internal.graph.kgstore")
-    fake_kg.KGStore = lambda cfg, client, llm_fn=None: SimpleNamespace(cfg=cfg)
+    fake_kg.KGStore = lambda cfg, client, llm_fn=None, user_id=None: SimpleNamespace(
+        cfg=cfg, user_id=user_id
+    )
 
     fake_gm_mod = types.ModuleType("internal.memory.graph_memory")
 
     class _GM:
-        def __init__(self, cfg, client, llm=None, sim_threshold=0.7, ltm=None):
+        def __init__(
+            self, cfg, client, llm=None, sim_threshold=0.7, ltm=None, *, user_id
+        ):
             self.ltm = ltm
+            self.user_id = user_id
 
         def sync_prev_id(self):
             pass

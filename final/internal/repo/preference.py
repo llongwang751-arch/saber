@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 
 
 class PGRepo:
-    """Postgres 实现；client 不可用时降级为空操作。"""
+    """Postgres 实现；写入失败必须向调用方报告，禁止虚假持久化确认。"""
 
     def __init__(self, client: PostgresClient):
         self.client = client
@@ -16,15 +16,18 @@ class PGRepo:
     # 写入或更新一条偏好
     def save(self, user_id: str, key: str, value: str) -> None:
         if self.client is None or not self.client.is_real():
-            return
+            raise RuntimeError("Preference persistence is unavailable")
         try:
-            self.client.exec(
+            affected = self.client.exec(
                 "INSERT INTO user_preferences (user_id, key, value) VALUES (%s, %s, %s) "
                 "ON CONFLICT (user_id, key) DO UPDATE SET value = %s, updated_at = NOW()",
                 (user_id, key, value, value),
             )
+            if affected != 1:
+                raise RuntimeError("Preference persistence did not commit")
         except Exception as e:
             logger.warning("⚠️  偏好保存到 PG 失败: %s", e)
+            raise
 
     # 返回该用户的所有偏好键值
     def load(self, user_id: str) -> Dict[str, str]:

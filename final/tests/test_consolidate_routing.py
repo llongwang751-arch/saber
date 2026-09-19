@@ -73,7 +73,7 @@ class _LtmRepo:
 def test_graph_aware_consolidate_protects_high_centrality(monkeypatch):
     """delete_from_db 中入度 >= 3 的节点被剔除。"""
     ltm = _LtmStub(result=_Result(delete=[1, 2, 3]))
-    gm = GraphMemory(_Cfg(), _NeoStub(), ltm=ltm)
+    gm = GraphMemory(_Cfg(), _NeoStub(), ltm=ltm, user_id="user-a")
 
     # 2 是高中心度节点 → 应保护
     monkeypatch.setattr(gm, "_get_high_centrality_ids",
@@ -89,13 +89,15 @@ def test_graph_aware_consolidate_protects_high_centrality(monkeypatch):
 def test_graph_aware_consolidate_no_neo4j_passthrough():
     """Neo4j 不可用时直接返回 ltm.consolidate 结果。"""
     ltm = _LtmStub(result=_Result(delete=[5]))
-    gm = GraphMemory(_Cfg(), _NeoStub(real=False), ltm=ltm)
+    gm = GraphMemory(
+        _Cfg(), _NeoStub(real=False), ltm=ltm, user_id="user-a"
+    )
     res = gm.graph_aware_consolidate()
     assert res.delete_from_db == [5]
 
 
 def test_graph_aware_consolidate_no_ltm_returns_none():
-    gm = GraphMemory(_Cfg(), _NeoStub())
+    gm = GraphMemory(_Cfg(), _NeoStub(), user_id="user-a")
     assert gm.graph_aware_consolidate() is None
 
 

@@ -1,6 +1,7 @@
 # llm — LLM 客户端（OpenAI 兼容 Chat Completions + Embedding，与 main 分支 Go 版协议对齐）
 import json
 import logging
+import os
 import re
 import threading
 import time
@@ -10,6 +11,7 @@ from typing import Callable, Dict, List, Optional
 import requests
 
 from config.config import APIConfig
+from internal.resilience.circuit_breaker import CircuitBreaker
 
 logger = logging.getLogger(__name__)
 
@@ -23,9 +25,15 @@ class Message:
 class Client:
     """LLM 客户端封装：OpenAI 兼容 Chat Completions + 火山方舟多模态 Embedding。"""
 
-    def __init__(self, cfg: APIConfig):
+    def __init__(self, cfg: APIConfig, *, usage_callback=None):
         self.cfg = cfg
+        self._usage_callback = usage_callback
         self._timeout = 60
+        self._embedding_circuit = CircuitBreaker(
+            failure_threshold=getattr(cfg, "embedding_failure_threshold", 3),
+            cooldown_seconds=getattr(cfg, "embedding_cooldown_seconds", 30.0),
+            half_open_max_calls=getattr(cfg, "embedding_half_open_max_calls", 1),
+        )
         self._mock_responses = {
             "你是谁": "我是一个全能 AI 助手，具备知识库、工具调用、推理、记忆和稳定执行能力。",
             "后端工程师": "后端工程师负责服务器端逻辑开发：API 设计、数据库、业务逻辑、系统架构、性能优化。",
@@ -41,6 +49,19 @@ class Client:
             return self._call_chat(system_prompt, messages)
         except Exception as e:
             logger.error("LLM API 调用失败: %s，回退到 Mock", e)
+            return self._mock(messages)
+
+    def chat_fast(self, messages: List[Message], system_prompt: str = "") -> str:
+        """Planner/Replanner/子 Agent 内部步骤使用快模型；未配置时回退主模型。"""
+        if not self.cfg.is_real_llm():
+            return self._mock(messages)
+        try:
+            return self._call_chat(
+                system_prompt, messages,
+                model=getattr(self.cfg, "llm_fast_model", "") or self.cfg.llm_model,
+            )
+        except Exception as e:
+            logger.error("Fast LLM API 调用失败: %s，回退到 Mock", e)
             return self._mock(messages)
 
     def chat_context(self, ctx, system_prompt: str, messages: List[Message]) -> str:
@@ -105,6 +126,8 @@ class Client:
         messages: List[Message],
         on_token: Optional[Callable[[str], None]],
     ) -> str:
+        from internal.resilience.budget import charge
+        charge("llm")
         msgs: List[Dict[str, str]] = []
         if system_prompt:
             msgs.append({"role": "system", "content": system_prompt})
@@ -228,14 +251,16 @@ class Client:
         t.start()
         return lambda: stop_evt.set()
 
-    def _call_chat(self, system_prompt: str, messages: List[Message]) -> str:
+    def _call_chat(self, system_prompt: str, messages: List[Message], model: str = "") -> str:
+        from internal.resilience.budget import charge
+        charge("llm")
         msgs: List[Dict[str, str]] = []
         if system_prompt:
             msgs.append({"role": "system", "content": system_prompt})
         msgs.extend({"role": m.role, "content": m.content} for m in messages)
 
         payload = {
-            "model": self.cfg.llm_model,
+            "model": model or self.cfg.llm_model,
             "messages": msgs,
             "temperature": self.cfg.temperature,
         }
@@ -252,6 +277,16 @@ class Client:
         choices = data.get("choices") or []
         if not choices:
             raise RuntimeError(f"API 返回空结果, body: {resp.text}")
+        callback = getattr(self, "_usage_callback", None)
+        if callback is not None:
+            usage = data.get("usage") or {}
+            measured = {key: value for key, value in usage.items()
+                        if key in {"prompt_tokens", "completion_tokens", "total_tokens"}
+                        and isinstance(value, int) and not isinstance(value, bool) and value >= 0} if isinstance(usage, dict) else {}
+            try:
+                callback(measured)
+            except Exception:
+                logger.warning("LLM usage observer failed")
         return choices[0].get("message", {}).get("content", "")
 
     # ── Embedding ───────────────────────────────────────────────────────────
@@ -260,7 +295,60 @@ class Client:
         """文本向量化；与 Go 主分支一致：失败时抛错，由调用方决定是否降级。"""
         if not self.cfg.is_real_embedding():
             raise RuntimeError("embedding API 未配置")
-        return self._call_embed(text)
+        if not self._embedding_circuit.allow_request():
+            raise RuntimeError("embedding circuit open")
+        try:
+            embedding = self._call_embed(text)
+        except Exception:
+            self._embedding_circuit.record_failure()
+            raise
+        self._embedding_circuit.record_success()
+        return embedding
+
+    def embed_batch(self, texts: List[str]) -> List[List[float]]:
+        """批量文本向量化，避免长文档逐 chunk 产生数千次 HTTP 请求。"""
+        if not texts:
+            return []
+        if not self.cfg.is_real_embedding():
+            raise RuntimeError("embedding API 未配置")
+        if not self._embedding_circuit.allow_request():
+            raise RuntimeError("embedding circuit open")
+        try:
+            embeddings = self._embed_batch_remote(texts)
+        except Exception:
+            self._embedding_circuit.record_failure()
+            raise
+        self._embedding_circuit.record_success()
+        return embeddings
+
+    def _embed_batch_remote(self, texts: List[str]) -> List[List[float]]:
+        api_url = self.cfg.embedding_api_url
+        if "/embeddings/multimodal" in api_url:
+            # 当前多模态端点返回单个 data 对象，不假设它支持文本批处理。
+            return [self._call_embed(text) for text in texts]
+
+        payload = {"model": self.cfg.embedding_model, "input": list(texts)}
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.cfg.embedding_api_key}",
+        }
+        resp = requests.post(api_url, headers=headers, json=payload, timeout=self._timeout)
+        if resp.status_code != 200:
+            raise RuntimeError(f"embedding API 返回错误状态 {resp.status_code}, body: {resp.text}")
+        result = resp.json()
+        if result.get("error"):
+            raise RuntimeError(f"embedding API 错误: {result['error'].get('message')}")
+        rows = result.get("data") or []
+        if len(rows) != len(texts):
+            raise RuntimeError(f"embedding 批量结果数量不匹配: expected={len(texts)}, actual={len(rows)}")
+        rows = sorted(rows, key=lambda row: int(row.get("index", 0)))
+        embeddings = [row.get("embedding") or [] for row in rows]
+        if any(not embedding for embedding in embeddings):
+            raise RuntimeError("embedding 批量结果包含空向量")
+        return embeddings
+
+    def embedding_circuit_snapshot(self) -> dict:
+        return self._embedding_circuit.snapshot().to_dict()
 
     def _call_embed(self, text: str) -> List[float]:
         api_url = self.cfg.embedding_api_url
@@ -333,6 +421,8 @@ class Client:
     # ── Mock ────────────────────────────────────────────────────────────────
 
     def _mock(self, messages: List[Message]) -> str:
+        if os.getenv("AGI_LLM_ALLOW_MOCK", "1").strip().lower() in {"0", "false", "no"}:
+            raise RuntimeError("真实模型暂不可用，当前部署禁止用模拟回复替代，请检查模型配置与服务状态")
         user_query = ""
         for m in messages:
             if m.role == "user":

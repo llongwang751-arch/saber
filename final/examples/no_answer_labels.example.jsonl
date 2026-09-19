@@ -1,0 +1,6 @@
+{"sample_id":"answerable-1","score":0.91,"answerable":true}
+{"sample_id":"answerable-2","score":0.72,"answerable":true}
+{"sample_id":"answerable-3","score":0.48,"answerable":true}
+{"sample_id":"unanswerable-1","score":0.06,"answerable":false}
+{"sample_id":"unanswerable-2","score":0.18,"answerable":false}
+{"sample_id":"unanswerable-3","score":0.27,"answerable":false}

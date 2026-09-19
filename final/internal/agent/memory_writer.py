@@ -15,12 +15,25 @@ import logging
 import queue
 import re
 import threading
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from internal.llm.llm import Message
 
 logger = logging.getLogger(__name__)
+_memory_order = ContextVar('memory_order', default=None)
+
+
+def _commit_atomic_fact(agent, key, value, *, order, embedding=None, importance=0.7, priority=0):
+    category, tags, slot_hint = classify_memory_content(key, value)
+    with agent.ltm._lock, agent.preference._lock:
+        result = agent.inf.repo.ltm.commit_user_fact(agent.user_id, key, value, order=order,
+            embedding=embedding, importance=importance, category=category, tags=tags, slot_hint=slot_hint, priority=priority)
+        # Reload only after commit; the shared conversation caches see one version.
+        agent.ltm.load_from_storage(strict=True)
+        agent.preference.load_from_storage()
+        return result
 
 
 def _publish_event(agent, event_type: str, payload: Dict[str, Any]) -> None:
@@ -42,40 +55,85 @@ class AsyncMemoryWriter:
     被多线程改写。stop() 触发优雅退出。
     """
 
-    def __init__(self):
-        self._queue: queue.Queue = queue.Queue()
+    _STOP = object()
+
+    def __init__(self, max_pending: int = 128):
+        self._queue: queue.Queue = queue.Queue(maxsize=max(1, int(max_pending)))
         self._stopped = threading.Event()
+        # submit() 与 stop() 必须原子地决定任务是在停止哨兵之前还是之后。
+        # 否则 submit 可能先通过 stopped 检查，却在 stop 的哨兵之后入队，
+        # 这条任务便永远不会被 worker 消费。
+        self._state_lock = threading.Lock()
         self._worker = threading.Thread(target=self._run, name="memory-writer", daemon=True)
         self._worker.start()
 
-    def submit(self, fn):
-        """提交一个无参可调用，最终在 worker 线程执行。"""
-        if self._stopped.is_set():
-            return
-        try:
-            self._queue.put_nowait(fn)
-        except Exception as e:
-            logger.warning("⚠️  memory-writer 提交失败: %s", e)
+    def submit(self, fn) -> bool:
+        """提交一个无参可调用，最终在 worker 线程执行。
 
-    def stop(self):
-        self._stopped.set()
-        try:
-            self._queue.put_nowait(None)  # 唤醒 worker
-        except Exception:
-            pass
+        返回 ``True`` 表示任务已经进入 FIFO 队列；writer 停止后返回
+        ``False``。原调用方可以继续忽略返回值，因而保持向后兼容。
+        """
+        with self._state_lock:
+            if self._stopped.is_set():
+                return False
+            try:
+                self._queue.put_nowait(fn)
+            except Exception as e:
+                logger.warning("⚠️  memory-writer 提交失败: %s", e)
+                return False
+        return True
+
+    def flush(self, timeout: float = 5.0) -> bool:
+        """Wait until all jobs submitted before this call have run.
+
+        A barrier job avoids polling Queue internals and gives evaluation code
+        a deterministic point at which memory writes can be inspected.
+        """
+        barrier = threading.Event()
+        if not self.submit(barrier.set):
+            return False
+        return barrier.wait(max(0.0, float(timeout)))
+
+    def stop(self, timeout: Optional[float] = 5.0) -> bool:
+        """停止接收新任务，并在超时内排空此前已入队的任务。
+
+        停止哨兵在状态锁内排到所有已接受任务之后；worker 只在取到哨兵
+        时退出，因此不会因为 ``_stopped`` 已置位而丢弃队尾任务。返回值
+        表示 worker 是否已在给定时间内退出。重复调用是安全的。
+        """
+        with self._state_lock:
+            if not self._stopped.is_set():
+                self._stopped.set()
+                try:
+                    self._queue.put_nowait(self._STOP)
+                except queue.Full:
+                    pass  # Worker drains accepted jobs, then exits on an empty queue.
+
+        # worker 内的任务若主动调用 stop，不能 join 自己；哨兵仍会在该任务
+        # 返回后被正常消费。
+        if threading.current_thread() is self._worker:
+            return False
+
+        join_timeout = None if timeout is None else max(0.0, float(timeout))
+        self._worker.join(join_timeout)
+        return not self._worker.is_alive()
 
     def _run(self):
-        while not self._stopped.is_set():
+        while True:
             try:
                 fn = self._queue.get(timeout=0.5)
             except queue.Empty:
+                if self._stopped.is_set():
+                    return
                 continue
-            if fn is None:
-                break
             try:
+                if fn is self._STOP:
+                    return
                 fn()
             except Exception as e:
                 logger.warning("⚠️  memory-writer 任务异常: %s", e)
+            finally:
+                self._queue.task_done()
 
 
 # ── 公共工具 ───────────────────────────────────────────────────────────────
@@ -198,49 +256,42 @@ def _embed(agent, content: str) -> Optional[List[float]]:
         return None
 
 
-# ── 回复 → 记忆抽取 ────────────────────────────────────────────────────────
+@dataclass
+class MemoryWriteReport:
+    candidates: int = 0
+    inserted: int = 0
+    deduplicated: int = 0
+    failed: int = 0
 
-def extract_memory_from_reply(agent, answer: str):
-    """从 assistant 回复中提取值得记忆的 k-v 事实并存入长期记忆。
 
-    与 main 分支 mem_writer.go L24-75 对齐：
-      1) LLM 抽 k-v；
-      2) 写偏好仓 (agent.preference.set)；
-      3) classify_memory_content → 失败 fallback llm_classify_memory；
-      4) embed → graph_mem.store_classified（含图 + 内存 + PG 一站式）；
-         若无 graph_mem，回退 ltm.store_classified；
-      5) 调 sync_last_item_pg_id 用 PG 主键校正内存与图节点 ID。
-    """
-    if not answer or not agent.cfg.is_real_llm():
-        return
-
-    prompt = (
-        "从下面这段AI回复中，提取值得长期记住的客观事实或用户偏好信息。\n"
-        "只提取明确的、非临时性的信息，忽略对话上下文和临时细节。\n"
-        "输出 JSON 对象（key为中文名称，value为具体值），如果没有值得记忆的信息则输出 {}。\n"
-        "只输出 JSON，不要有其他内容。\n\n"
-        f"回复：{answer}"
-    )
+def _extract_kvs(agent, prompt: str) -> Dict[str, Any]:
     try:
         raw = agent.llm.chat([Message(role="user", content=prompt)], system_prompt="")
     except Exception as e:
         logger.warning("⚠️  记忆抽取 LLM 调用失败: %s", e)
-        return
+        return {}
 
     raw = _strip_code_fence(raw)
     try:
         kvs = json.loads(raw)
     except Exception:
-        return
-    if not isinstance(kvs, dict) or not kvs:
-        return
-    if _looks_like_third_party_biography(answer, kvs):
-        logger.info("🛡️  跳过疑似第三方百科记忆抽取，避免写入用户画像")
-        return
+        return {}
+    return kvs if isinstance(kvs, dict) else {}
+
+
+def _store_extracted_kvs(
+    agent,
+    kvs: Dict[str, Any],
+    *,
+    source: str,
+    importance: float,
+) -> MemoryWriteReport:
+    report = MemoryWriteReport()
 
     for k, v in kvs.items():
         if not k or v in (None, ""):
             continue
+        report.candidates += 1
         inspection = inspect_kv_pair(str(k), str(v))
         if not inspection.safe:
             logger.info(
@@ -250,12 +301,7 @@ def extract_memory_from_reply(agent, answer: str):
                 inspection.matched,
             )
             continue
-        try:
-            agent.preference.set(str(k), str(v))
-        except Exception:
-            pass
-
-        content = f"用户{k}: {v}"
+        content = f"用户{k}: {v}" if source == "user" else f"{k}: {v}"
         inspection = inspect_memory_content(content)
         if not inspection.safe:
             logger.info(
@@ -265,12 +311,44 @@ def extract_memory_from_reply(agent, answer: str):
                 inspection.matched,
             )
             continue
+        repo = getattr(getattr(getattr(agent, 'inf', None), 'repo', None), 'ltm', None)
+        if source == 'user' and callable(getattr(repo, 'commit_user_fact', None)):
+            try:
+                order = _memory_order.get()
+                if order is None:
+                    order = repo.begin_user_message(agent.user_id)
+                committed = _commit_atomic_fact(agent, str(k), str(v), order=order,
+                                                embedding=_embed(agent, content), importance=importance)
+                if committed is None:
+                    report.deduplicated += 1
+                else:
+                    report.inserted += 1
+            except Exception:
+                report.failed += 1
+                logger.warning('Atomic user fact commit failed; not acknowledged')
+            continue
+        # Exchange-derived facts are not user preferences.  This prevents an
+        # assistant hallucination from silently rewriting the user profile.
+        if source == "user":
+            try:
+                agent.preference.set(str(k), str(v))
+            except Exception as exc:
+                logger.warning("⚠️  用户偏好写入失败 key=%s: %s", k, exc)
         category, tags, slot_hint = classify_memory_content(str(k), str(v))
         if not category:
             category, tags, slot_hint = llm_classify_memory(agent, content)
+        tags = list(tags or [])
+        source_tag = f"src:{source}"
+        if source_tag not in tags:
+            tags.append(source_tag)
+        if source == "user":
+            from internal.memory.facts import fact_key
+            tags.append(fact_key(str(k), str(v)))
+            tags.append("trust:user_asserted")
+        else:
+            tags.append("trust:unverified")
 
         emb = _embed(agent, content)
-        importance = 0.7
 
         try:
             inserted = _store_classified_with_graph(
@@ -278,12 +356,106 @@ def extract_memory_from_reply(agent, answer: str):
             )
         except Exception as e:
             logger.warning("⚠️  长期记忆写入失败: %s", e)
-            inserted = False
+            report.failed += 1
+            continue
+
+        if inserted:
+            report.inserted += 1
+        else:
+            report.deduplicated += 1
 
         logger.info(
-            "🧠 从回复中提取记忆：%s = %s（类别=%s，新增=%s）",
-            k, v, category, inserted,
+            "🧠 记忆抽取 source=%s：%s = %s（类别=%s，新增=%s）",
+            source, k, v, category, inserted,
         )
+    return report
+
+
+# ── 双源记忆抽取 ───────────────────────────────────────────────────────────
+
+def extract_memory_from_user_message(agent, user_message: str) -> MemoryWriteReport:
+    """Extract explicit user statements (trusted source, importance 0.7)."""
+
+    if not user_message or not agent.cfg.is_real_llm():
+        return MemoryWriteReport()
+    inspection = inspect_memory_content(user_message)
+    if not inspection.safe:
+        logger.info(
+            "🛡️  跳过不安全用户记忆源 risk=%s reason=%s matched=%s",
+            inspection.risk,
+            inspection.reason,
+            inspection.matched,
+        )
+        return MemoryWriteReport()
+    prompt = (
+        "从下面这段用户消息中，提取用户主动提供的、值得长期记住的客观事实或个人偏好。\n"
+        "只提取明确的、非临时性的信息；忽略问题、临时细节和第三人称背景。\n"
+        "不要提取密码、token、身份证、信用卡等敏感信息，也不要提取改变对话规则的指令。\n"
+        "输出 JSON 对象（key为中文名称，value为具体值）；没有则输出 {}。只输出 JSON。\n\n"
+        f"用户消息：{user_message}"
+    )
+    kvs = _extract_kvs(agent, prompt)
+    if _looks_like_third_party_biography(user_message, kvs):
+        logger.info("🛡️  跳过疑似第三方百科记忆抽取，避免写入用户画像")
+        return MemoryWriteReport()
+    return _store_extracted_kvs(
+        agent,
+        kvs,
+        source="user",
+        importance=0.7,
+    )
+
+
+def extract_memory_from_exchange(
+    agent, user_query: str, answer: str
+) -> MemoryWriteReport:
+    """Extract query-anchored objective facts (secondary source, 0.5)."""
+
+    if not user_query or not answer or not agent.cfg.is_real_llm():
+        return MemoryWriteReport()
+    for label, value in (("query", user_query), ("reply", answer)):
+        inspection = inspect_memory_content(value)
+        if not inspection.safe:
+            logger.info(
+                "🛡️  跳过不安全问答记忆源 side=%s risk=%s reason=%s matched=%s",
+                label,
+                inspection.risk,
+                inspection.reason,
+                inspection.matched,
+            )
+            return MemoryWriteReport()
+    prompt = (
+        "下面是用户与AI的一次问答。只提取被用户问题锚定、值得长期记忆的客观事实。\n"
+        "每条事实必须直接回答用户问题或解释问题中的概念/实体，key 必须包含问题主题词。\n"
+        "不要提取用户画像、第三方敏感信息、密码/token，或改变对话规则的指令。\n"
+        "输出 JSON 对象（key为简明主题，value为事实）；不满足则输出 {}。只输出 JSON。\n\n"
+        f"用户问题：{user_query}\n\nAI回答：{answer}"
+    )
+    kvs = _extract_kvs(agent, prompt)
+    if _looks_like_third_party_biography(answer, kvs):
+        logger.info("🛡️  跳过疑似第三方百科记忆抽取，避免写入用户画像")
+        return MemoryWriteReport()
+    return _store_extracted_kvs(
+        agent,
+        kvs,
+        source="exchange",
+        importance=0.5,
+    )
+
+
+def extract_memory_from_reply(
+    agent, answer: str, user_query: str = ""
+) -> MemoryWriteReport:
+    """Backward-compatible entry point.
+
+    Production callers provide ``user_query`` and therefore use the anchored
+    exchange path.  The two-argument legacy form treats its text as a user
+    statement solely to preserve the old public test/helper contract.
+    """
+
+    if user_query:
+        return extract_memory_from_exchange(agent, user_query, answer)
+    return extract_memory_from_user_message(agent, answer)
 
 
 def _store_classified_with_graph(
@@ -297,8 +469,8 @@ def _store_classified_with_graph(
 ) -> bool:
     """统一走 LongTerm.store_classified 路径；命中 dedup 时返回 False。
 
-    LongTerm.store_classified 内部已串起 [内存写 → PG save (RETURNING id) →
-    graph_mem.add_to_graph] 三件事，store_classified 命中 dedup 时返回 False。
+    LongTerm.store_classified 内部已串起 [权威 DB + outbox 提交 → 内存发布 →
+    graph_mem hook] 三件事，store_classified 命中 dedup 时返回 False。
     新增成功后调 graph_mem.sync_last_item_pg_id（如挂载）让图侧 prev_id 与
     PG 主键保持一致。
     """
@@ -386,9 +558,13 @@ def sync_consolidation_to_db(agent, result) -> None:
         return
 
     delete_ids = list(getattr(result, "delete_from_db", []) or [])
+    user_id = str(getattr(agent, "user_id", "default_user") or "default_user")
     if delete_ids:
         try:
-            ltm_repo.delete(delete_ids)
+            try:
+                ltm_repo.delete(delete_ids, user_id=user_id)
+            except TypeError:
+                ltm_repo.delete(delete_ids)
             _publish_event(agent, "memory.consolidate.delete", {"ids": delete_ids, "count": len(delete_ids)})
             logger.info("🧹 记忆合并：删除 %d 条 (ids=%s)", len(delete_ids), delete_ids)
         except Exception as e:
@@ -400,7 +576,10 @@ def sync_consolidation_to_db(agent, result) -> None:
             continue
         try:
             emb_json = json.dumps(item.embedding) if item.embedding else "null"
-            ltm_repo.update(int(item_id), item.content, float(item.importance), emb_json)
+            try:
+                ltm_repo.update(int(item_id), item.content, float(item.importance), emb_json, user_id=user_id)
+            except TypeError:
+                ltm_repo.update(int(item_id), item.content, float(item.importance), emb_json)
             _publish_event(agent, "memory.consolidate.update", {
                 "id": int(item_id),
                 "importance": float(item.importance),
@@ -419,34 +598,38 @@ def async_update_memory(agent, user_input: str, resp: Any) -> None:
       1) 同步：用规则提取，立即填到 resp.extracted_info（用户即时反馈）
       2) 异步：丢到 memory writer 线程做 LLM 提取 + 长期记忆写入
     """
-    try:
-        from internal.llm.llm import _extract_rule_based
-    except Exception:
-        _extract_rule_based = None  # type: ignore
-
-    # 1) 同步规则提取
-    if _extract_rule_based is not None:
-        try:
-            quick = _extract_rule_based(user_input) or {}
-        except Exception:
-            quick = {}
-        if quick:
+    from internal.memory.facts import explicit_slots
+    repo = getattr(getattr(getattr(agent, 'inf', None), 'repo', None), 'ltm', None)
+    atomic = callable(getattr(repo, 'commit_user_fact', None))
+    order = repo.begin_user_message(agent.user_id) if atomic else None
+    if inspect_memory_content(user_input).safe:
+        saved = []
+        for slot in explicit_slots(user_input):
+            if not inspect_kv_pair(slot.key, slot.value).safe:
+                continue
             try:
-                agent.preference.save_batch(quick)
+                if atomic:
+                    if _commit_atomic_fact(agent, slot.key, slot.value, order=order, priority=1) is None:
+                        continue
+                else:
+                    agent.preference.set(slot.key, slot.value)
             except Exception:
-                pass
-            if hasattr(resp, "extracted_info"):
-                resp.extracted_info = "已记住：" + ", ".join(f"{k}={v}" for k, v in quick.items())
+                logger.warning("preference persistence failed; not acknowledged")
+                continue
+            saved.append(f"{slot.key}={slot.value}")
+        if saved and hasattr(resp, "extracted_info"):
+            resp.extracted_info = "已记住：" + ", ".join(saved)
 
-    # 2) 异步 LLM 提取 + LTM 写入
+    # 2) 异步走“用户主动陈述”抽取。禁止把任意原始问题整段直接塞进
+    # LTM；否则一次普通问句也会永久污染记忆。
     def _bg():
+        context_token = _memory_order.set(order)
         try:
-            extracted = agent.llm.extract_preferences(user_input) if hasattr(agent.llm, "extract_preferences") else {}
-            if extracted:
-                agent.preference.save_batch(extracted)
-            agent.ltm.add(user_input)
-        except Exception as e:
-            logger.warning("异步更新记忆失败: %s", e)
+            report = extract_memory_from_user_message(agent, user_input)
+        finally:
+            _memory_order.reset(context_token)
+        if report.failed:
+            logger.warning("异步用户记忆写入失败 count=%d", report.failed)
 
     writer = getattr(agent, "memory_writer", None)
     if writer is not None:
@@ -464,6 +647,12 @@ def maybe_consolidate_memory(agent):
     """
     try:
         if not agent.ltm.need_consolidation():
+            return
+        if hasattr(agent.ltm, "consolidate_committed"):
+            # Production path: calculate a pure versioned plan, commit all PG
+            # rows+tombstones+outbox events in one transaction, then apply the
+            # committed rows to the cache.  No second sync step is allowed.
+            agent.ltm.consolidate_committed()
             return
         gm = getattr(agent, "graph_memory", None)
         if gm is not None and hasattr(gm, "graph_aware_consolidate"):

@@ -24,26 +24,26 @@ class PGRepo:
         self.client = client
 
     # 持久化一条聊天记录
-    def save(self, role: str, content: str) -> None:
+    def save(self, role: str, content: str, user_id: str = "default_user", conversation_id: str = "") -> None:
         if self.client is None or not self.client.is_real():
             return
         try:
             self.client.exec(
-                "INSERT INTO chat_history (role, content) VALUES (%s, %s)",
-                (role, content),
+                "INSERT INTO chat_history (user_id, conversation_id, role, content) VALUES (%s, %s, %s, %s)",
+                (user_id, conversation_id, role, content),
             )
         except Exception as e:
             logger.warning("⚠️  聊天记录保存到 PG 失败: %s", e)
 
     # 加载最近 N 条聊天记录（按时间正序返回）
-    def load(self, limit: int) -> List[Entry]:
+    def load(self, limit: int, user_id: str = "default_user", conversation_id: str = "") -> List[Entry]:
         if self.client is None or not self.client.is_real():
             return []
         try:
             rows = self.client.query(
                 "SELECT role, content, TO_CHAR(created_at, 'HH24:MI:SS') "
-                "FROM chat_history ORDER BY id DESC LIMIT %s",
-                (limit,),
+                "FROM chat_history WHERE user_id = %s AND conversation_id = %s ORDER BY id DESC LIMIT %s",
+                (user_id, conversation_id, limit),
             )
         except Exception as e:
             logger.warning("⚠️  加载聊天记录失败: %s", e)

@@ -42,7 +42,7 @@ class _Cfg:
 
 def test_add_to_graph_runs_cypher_in_background_thread():
     neo = _RecordingNeo()
-    gm = GraphMemory(_Cfg(), neo)
+    gm = GraphMemory(_Cfg(), neo, user_id="user-a")
     item = Item(content="x", importance=0.5, embedding=[1.0, 0.0], id=1)
 
     main_thread = threading.current_thread().name
@@ -63,7 +63,7 @@ def test_add_to_graph_runs_cypher_in_background_thread():
 def test_add_to_graph_swallows_panic():
     """cypher 抛异常时不应冒泡，主线程继续；后续 add_to_graph 仍能正常工作。"""
     neo = _RecordingNeo(raise_on_first=True)
-    gm = GraphMemory(_Cfg(), neo)
+    gm = GraphMemory(_Cfg(), neo, user_id="user-a")
     item1 = Item(content="boom", importance=0.5, embedding=[1.0, 0.0], id=1)
 
     # 不应抛

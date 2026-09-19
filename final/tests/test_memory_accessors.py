@@ -158,13 +158,13 @@ class _NeoStub:
 def test_graph_memory_sync_prev_id_pulls_from_ltm():
     ltm = _ltm()
     _seed(ltm)
-    gm = GraphMemory(_Cfg(), _NeoStub(), ltm=ltm)
+    gm = GraphMemory(_Cfg(), _NeoStub(), ltm=ltm, user_id="user-a")
     assert gm.prev_id == -1
     gm.sync_prev_id()
     assert gm.prev_id == 20
 
     # 没有 LTM 时 no-op
-    gm2 = GraphMemory(_Cfg(), _NeoStub())
+    gm2 = GraphMemory(_Cfg(), _NeoStub(), user_id="user-a")
     gm2.prev_id = 7
     gm2.sync_prev_id()
     assert gm2.prev_id == 7
@@ -172,7 +172,7 @@ def test_graph_memory_sync_prev_id_pulls_from_ltm():
 
 def test_graph_memory_set_consolidation_config_proxies():
     ltm = _ltm()
-    gm = GraphMemory(_Cfg(), _NeoStub(), ltm=ltm)
+    gm = GraphMemory(_Cfg(), _NeoStub(), ltm=ltm, user_id="user-a")
     new_cfg = SimpleNamespace(
         memory_consolidation_similarity=0.5,
         memory_consolidation_dedup=0.6,
@@ -187,19 +187,19 @@ def test_graph_memory_set_consolidation_config_proxies():
 
 def test_graph_memory_need_consolidation_proxies():
     ltm = _ltm()
-    gm = GraphMemory(_Cfg(), _NeoStub(), ltm=ltm)
+    gm = GraphMemory(_Cfg(), _NeoStub(), ltm=ltm, user_id="user-a")
     ltm._items_since_last = 0
     assert gm.need_consolidation() is False
     ltm._items_since_last = 5
     assert gm.need_consolidation() is True
 
-    gm_no_ltm = GraphMemory(_Cfg(), _NeoStub())
+    gm_no_ltm = GraphMemory(_Cfg(), _NeoStub(), user_id="user-a")
     assert gm_no_ltm.need_consolidation() is False
 
 
 def test_set_graph_memory_back_injects_ltm():
     ltm = _ltm()
-    gm = GraphMemory(_Cfg(), _NeoStub())
+    gm = GraphMemory(_Cfg(), _NeoStub(), user_id="user-a")
     assert gm.ltm is None
     ltm.set_graph_memory(gm)
     assert gm.ltm is ltm

@@ -169,6 +169,7 @@ def _request(app, method, path, body=b"", content_type="application/json"):
     async def _run():
         sent = False
         messages = []
+        response_complete = asyncio.Event()
         scope = {
             "type": "http",
             "asgi": {"version": "3.0"},
@@ -186,12 +187,15 @@ def _request(app, method, path, body=b"", content_type="application/json"):
         async def receive():
             nonlocal sent
             if sent:
+                await response_complete.wait()
                 return {"type": "http.disconnect"}
             sent = True
             return {"type": "http.request", "body": body, "more_body": False}
 
         async def send(message):
             messages.append(message)
+            if message["type"] == "http.response.body" and not message.get("more_body", False):
+                response_complete.set()
 
         await app(scope, receive, send)
         status = next(m["status"] for m in messages if m["type"] == "http.response.start")

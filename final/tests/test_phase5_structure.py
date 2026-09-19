@@ -13,7 +13,7 @@ def test_removed_legacy_rag_helpers_are_absent():
 
 
 def test_engine_query_uses_hybrid_store_search_multi_without_legacy_fallback():
-    source = inspect.getsource(Engine.query_with_history)
+    source = inspect.getsource(Engine.query_with_history_trace)
 
     assert "search_multi" in source
     assert "_rrf_fuse" not in source

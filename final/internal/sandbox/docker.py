@@ -1,5 +1,6 @@
 # sandbox.docker — 通过 docker CLI 在隔离容器内执行命令
 import logging
+import os
 import subprocess
 import time
 from typing import List
@@ -7,6 +8,19 @@ from typing import List
 from .types import ExecRequest, ExecResult, SandboxConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _container_user() -> str:
+    """Linux 上以宿主同 uid/gid 运行容器，避免容器内 root 写宿主文件。
+
+    Windows/macOS 的 Docker Desktop 由 vm 层做 uid 映射，返回空串跳过。
+    """
+    if os.name != "posix":
+        return ""
+    try:
+        return f"{os.getuid()}:{os.getgid()}"
+    except Exception:
+        return ""
 
 
 def _truncate_bytes(data: bytes, max_bytes: int) -> tuple:
@@ -71,7 +85,7 @@ class DockerSandbox:
         if timeout <= 0:
             timeout = 30.0
 
-        args = self._build_docker_args(req.command)
+        args = self._build_docker_args(req.command, req.workspace_host_dir)
 
         try:
             proc = subprocess.run(
@@ -107,7 +121,7 @@ class DockerSandbox:
 
         return result
 
-    def _build_docker_args(self, command: str) -> List[str]:
+    def _build_docker_args(self, command: str, workspace_host_dir: str = "") -> List[str]:
         """构造 docker run 的完整参数列表"""
         args = [
             "run",
@@ -116,6 +130,10 @@ class DockerSandbox:
             "--security-opt", "no-new-privileges",
             "--cap-drop", "ALL",
         ]
+
+        run_as = _container_user()
+        if run_as:
+            args += ["--user", run_as]
 
         if self.cfg.network_disabled:
             args += ["--network", "none"]
@@ -128,6 +146,8 @@ class DockerSandbox:
             args += ["--cpus", f"{self.cfg.cpu_percent / 100.0:.2f}"]
         if self.cfg.max_pids > 0:
             args += ["--pids-limit", str(self.cfg.max_pids)]
+        if workspace_host_dir:
+            args += ["--mount", f"type=bind,src={workspace_host_dir},dst=/workspace", "-w", "/workspace"]
 
         image = self.cfg.image or "ubuntu:22.04"
         args += [image, "sh", "-c", command]

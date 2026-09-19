@@ -180,8 +180,11 @@ def test_merge_on_mid_similarity():
     # category / slot_hint 取 i 优先
     assert merged.category == "fact"
     assert merged.slot_hint == "memory_facts"
-    # created_at 取更早
-    assert math.isclose(merged.created_at, now - 120.0, rel_tol=0, abs_tol=1e-3)
+    # Go mergeItemsPure keeps the stronger survivor's identity/timestamp and
+    # records the removed row as forward supersession provenance.
+    assert math.isclose(merged.created_at, now - 60.0, rel_tol=0, abs_tol=1e-3)
+    assert merged.id == 200
+    assert merged.supersedes == [201]
     # embedding 加权平均（每维 = (wi*ai + wj*bj) / (wi+wj)）
     # 用衰减后的 importance 作为权重
     wi = 0.6 * 0.99 ** ((now - (now - 60.0)) / 86400.0)

@@ -1,5 +1,6 @@
 # memory — 三层记忆系统（短期 / 长期 / 用户偏好）
 import json
+import inspect
 import logging
 import math
 import re
@@ -11,6 +12,15 @@ from typing import Any, Deque, Dict, List, Optional, TYPE_CHECKING
 
 from config.config import APIConfig
 from internal.infra.infra import Infrastructure
+from internal.memory.consistency import (
+    CommittedChangeSet,
+    ConsolidationPlan,
+    MemoryCommitError,
+    MemoryDelete,
+    MemoryRecord,
+    MemoryUpdate,
+    compute_content_hash,
+)
 
 if TYPE_CHECKING:
     from internal.memory.graph_memory import GraphMemory  # noqa: F401
@@ -43,7 +53,15 @@ class Item:
     score: float = 0.0
     status: str = "active"
     superseded_by: Optional[int] = None
+    superseded_at: Optional[float] = None
+    # Forward provenance: this item replaced these older memory ids.  The
+    # field is part of the projection hash and must survive cache reloads.
+    supersedes: List[int] = field(default_factory=list)
     quarantine_reason: str = ""
+    version: int = 1
+    content_hash: str = ""
+    updated_at: float = 0.0
+    deleted_at: Optional[float] = None
 
 
 @dataclass
@@ -132,9 +150,10 @@ def _tokenize_zh(text: str) -> List[str]:
 class LongTerm:
     """长期记忆 - 基于 embedding 的语义记忆。"""
 
-    def __init__(self, cfg: APIConfig, inf: Infrastructure):
+    def __init__(self, cfg: APIConfig, inf: Infrastructure, user_id: str = "default_user"):
         self.cfg = cfg
         self.inf = inf
+        self.user_id = str(user_id or "default_user")
         self.items: List[Item] = []
         self._embed_fn: Optional[Any] = None
         self._last_consolidate_ts = 0.0
@@ -159,7 +178,13 @@ class LongTerm:
             score=item.score if score is None else score,
             status=item.status,
             superseded_by=item.superseded_by,
+            superseded_at=item.superseded_at,
+            supersedes=list(item.supersedes),
             quarantine_reason=item.quarantine_reason,
+            version=item.version,
+            content_hash=item.content_hash,
+            updated_at=item.updated_at,
+            deleted_at=item.deleted_at,
         )
 
     def set_embed_fn(self, fn):
@@ -179,9 +204,14 @@ class LongTerm:
             except Exception:
                 pass
 
-    def load_from_storage(self):
-        rows = self.inf.repo.ltm.load()
-        self.items = []
+    def load_from_storage(self, *, strict: bool = False):
+        method = (
+            "load_committed"
+            if strict and hasattr(self.inf.repo.ltm, "load_committed")
+            else "load"
+        )
+        rows = self._repo_call(method)
+        loaded: List[Item] = []
         for r in rows:
             created_ts = getattr(r, "created_at", None)
             if hasattr(created_ts, "timestamp"):
@@ -193,7 +223,8 @@ class LongTerm:
                 last_ts = last_ts.timestamp()
             elif not isinstance(last_ts, (int, float)) or not last_ts:
                 last_ts = created_ts
-            self.items.append(Item(
+            loaded.append(Item(
+                id=getattr(r, "id", None),
                 content=r.content,
                 importance=r.importance,
                 embedding=r.embedding,
@@ -205,21 +236,200 @@ class LongTerm:
                 score=float(getattr(r, "score", 0.0) or 0.0),
                 status=getattr(r, "status", "") or "active",
                 superseded_by=getattr(r, "superseded_by", None),
+                superseded_at=(
+                    self._timestamp(getattr(r, "superseded_at", None))
+                    if getattr(r, "superseded_at", None) is not None
+                    else None
+                ),
+                supersedes=[int(value) for value in (getattr(r, "supersedes", []) or [])],
                 quarantine_reason=getattr(r, "quarantine_reason", "") or "",
+                version=int(getattr(r, "version", 1) or 1),
+                content_hash=getattr(r, "content_hash", "") or "",
+                updated_at=float(getattr(r, "updated_at", 0.0) or 0.0),
+                deleted_at=getattr(r, "deleted_at", None),
             ))
         # 重建 id 序列，确保后续 add 不与已有 item 冲突
-        for idx, item in enumerate(self.items):
-            item.id = idx
-        self._next_id = len(self.items)
-        logger.info("✅ 从存储恢复了 %d 条长期记忆", len(self.items))
+        with self._lock:
+            self.items = loaded
+            existing_ids = [int(item.id) for item in self.items if item.id is not None]
+            self._next_id = (max(existing_ids) + 1) if existing_ids else 0
+        logger.info("✅ 从存储恢复了 %d 条长期记忆", len(loaded))
         # 图增强记忆 hook：批量索引（启动期把 LTM 全量同步进图）
         if self.graph_memory is not None:
             try:
-                self.graph_memory.bulk_index(self.items)
+                self.graph_memory.bulk_index(loaded)
             except Exception as e:
                 logger.warning("⚠️  graph_memory.bulk_index 失败: %s", e)
 
-    def add(self, content: str, importance: float = 0.5):
+    @staticmethod
+    def _timestamp(value: Any, fallback: float = 0.0) -> float:
+        if hasattr(value, "timestamp"):
+            try:
+                return float(value.timestamp())
+            except Exception:
+                return float(fallback)
+        try:
+            return float(value) if value is not None else float(fallback)
+        except (TypeError, ValueError):
+            return float(fallback)
+
+    def _item_from_committed(self, value: Any, fallback: Item) -> Item:
+        """Convert a repository commit result into the cache representation."""
+
+        memory_id = getattr(value, "memory_id", getattr(value, "id", fallback.id))
+        try:
+            memory_id = int(memory_id)
+        except (TypeError, ValueError) as exc:
+            raise MemoryCommitError("memorytx: commit returned an invalid memory id") from exc
+        if memory_id <= 0:
+            raise MemoryCommitError("memorytx: commit returned a non-positive memory id")
+        owner = getattr(value, "user_id", self.user_id)
+        if owner and str(owner) != self.user_id:
+            raise MemoryCommitError("memorytx: commit returned a row from another tenant")
+        version = int(getattr(value, "version", fallback.version) or 1)
+        if version <= 0:
+            raise MemoryCommitError("memorytx: commit returned an invalid version")
+        deleted_at = getattr(value, "deleted_at", fallback.deleted_at)
+        quarantined = bool(getattr(value, "quarantined", False))
+        superseded = bool(getattr(value, "superseded", False))
+        status = getattr(value, "status", "") or (
+            "quarantined" if quarantined else "superseded" if superseded else fallback.status
+        )
+        item = Item(
+            id=memory_id,
+            content=str(getattr(value, "content", fallback.content) or ""),
+            importance=float(getattr(value, "importance", fallback.importance) or 0.0),
+            embedding=list(getattr(value, "embedding", fallback.embedding) or []) or None,
+            created_at=self._timestamp(getattr(value, "created_at", None), fallback.created_at),
+            last_accessed=self._timestamp(
+                getattr(value, "last_accessed", None), fallback.last_accessed
+            ),
+            category=str(getattr(value, "category", fallback.category) or ""),
+            tags=[str(tag) for tag in (getattr(value, "tags", fallback.tags) or [])],
+            slot_hint=str(getattr(value, "slot_hint", fallback.slot_hint) or ""),
+            score=float(getattr(value, "score", fallback.score) or 0.0),
+            status=status,
+            superseded_by=getattr(value, "superseded_by", fallback.superseded_by),
+            superseded_at=(
+                self._timestamp(getattr(value, "superseded_at", None))
+                if getattr(value, "superseded_at", None) is not None
+                else fallback.superseded_at
+            ),
+            supersedes=[
+                int(entry)
+                for entry in (getattr(value, "supersedes", fallback.supersedes) or [])
+            ],
+            quarantine_reason=str(
+                getattr(value, "quarantine_reason", fallback.quarantine_reason) or ""
+            ),
+            version=version,
+            content_hash=str(getattr(value, "content_hash", "") or ""),
+            updated_at=self._timestamp(getattr(value, "updated_at", None), fallback.updated_at),
+            deleted_at=(
+                self._timestamp(deleted_at) if deleted_at is not None else None
+            ),
+        )
+        return item
+
+    def _commit_create(self, item: Item) -> Item:
+        """Persist row+outbox first and return the authoritative cache value."""
+
+        repo = self.inf.repo.ltm
+        create = getattr(repo, "create_committed", None)
+        if callable(create):
+            committed = self._repo_call(
+                "create_committed",
+                item.content,
+                item.importance,
+                list(item.embedding or []),
+                created_at=item.created_at,
+                last_accessed=item.last_accessed,
+                category=item.category,
+                tags=item.tags,
+                slot_hint=item.slot_hint,
+                score=item.score,
+            )
+            return self._item_from_committed(committed, item)
+
+        # Legacy/test repositories retain save()->id.  A sentinel failure is
+        # not success: accepting -1 used to create an in-memory ghost.
+        stored_id = self._repo_call(
+            "save",
+            item.content,
+            item.importance,
+            json.dumps(item.embedding) if item.embedding else "null",
+            created_at=item.created_at,
+            last_accessed=item.last_accessed,
+            category=item.category,
+            tags=item.tags,
+            slot_hint=item.slot_hint,
+            score=item.score,
+        )
+        if not isinstance(stored_id, int) or stored_id <= 0:
+            raise MemoryCommitError("memorytx: legacy repository did not commit the memory")
+        record = MemoryRecord(
+            memory_id=stored_id,
+            user_id=self.user_id,
+            content=item.content,
+            importance=item.importance,
+            embedding=list(item.embedding or []),
+            category=item.category,
+            tags=list(item.tags),
+            slot_hint=item.slot_hint,
+            version=1,
+            created_at=item.created_at,
+            updated_at=item.created_at,
+            last_accessed=item.last_accessed,
+        )
+        record.content_hash = compute_content_hash(record)
+        return self._item_from_committed(record, item)
+
+    def _commit_classified_update(self, proposed: Item, expected_version: int) -> Item:
+        repo = self.inf.repo.ltm
+        commit = getattr(repo, "update_classified_committed", None)
+        if callable(commit):
+            result = self._repo_call(
+                "update_classified_committed",
+                int(proposed.id),
+                proposed.importance,
+                proposed.tags,
+                proposed.category,
+                proposed.slot_hint,
+                proposed.last_accessed,
+                expected_version=expected_version,
+            )
+            return self._item_from_committed(result, proposed)
+
+        result = self._repo_call(
+            "update_classified",
+            int(proposed.id),
+            proposed.importance,
+            proposed.tags,
+            proposed.category,
+            proposed.slot_hint,
+            proposed.last_accessed,
+        )
+        if result is not None:
+            return self._item_from_committed(result, proposed)
+        # Compatibility-only repositories signal success by returning None.
+        record = MemoryRecord(
+            memory_id=int(proposed.id),
+            user_id=self.user_id,
+            content=proposed.content,
+            importance=proposed.importance,
+            embedding=list(proposed.embedding or []),
+            category=proposed.category,
+            tags=list(proposed.tags),
+            slot_hint=proposed.slot_hint,
+            version=expected_version + 1,
+            created_at=proposed.created_at,
+            updated_at=proposed.last_accessed,
+            last_accessed=proposed.last_accessed,
+        )
+        record.content_hash = compute_content_hash(record)
+        return self._item_from_committed(record, proposed)
+
+    def add(self, content: str, importance: float = 0.5) -> Item:
         embedding = None
         if self._embed_fn:
             try:
@@ -232,41 +442,33 @@ class LongTerm:
             content=content,
             importance=importance,
             embedding=embedding,
-            id=self._next_id,
+            id=None,
             created_at=now_ts,
             last_accessed=now_ts,
         )
-        self._next_id += 1
-        # 旧条目快照（add_to_graph 内会扫描这些建立 SIMILAR_TO 边）
-        prior = list(self.items)
-        self.items.append(item)
-        self._items_since_last += 1
-        emb_json = json.dumps(embedding) if embedding else "null"
-        self.inf.repo.ltm.save(
-            content,
-            importance,
-            emb_json,
-            created_at=now_ts,
-            last_accessed=now_ts,
-            category=item.category,
-            tags=item.tags,
-            slot_hint=item.slot_hint,
-            score=item.score,
-        )
+        committed = self._commit_create(item)
+        with self._lock:
+            prior = [self._copy_item(existing) for existing in self.items]
+            self.items.append(committed)
+            self._items_since_last += 1
+            self._next_id = max(self._next_id, int(committed.id) + 1)
         _publish_event(self.inf, "memory.longterm.add", {
-            "id": item.id,
+            "id": committed.id,
             "content": content,
             "importance": importance,
-            "category": item.category,
-            "tags": item.tags,
+            "category": committed.category,
+            "tags": committed.tags,
+            "version": committed.version,
+            "content_hash": committed.content_hash,
         })
 
         # 图增强记忆 hook：新增条目同步进图
         if self.graph_memory is not None:
             try:
-                self.graph_memory.add_to_graph(item, neighbors=prior[-50:])
+                self.graph_memory.add_to_graph(committed, neighbors=prior[-50:])
             except Exception as e:
                 logger.warning("⚠️  graph_memory.add_to_graph 失败: %s", e)
+        return self._copy_item(committed)
 
     def store_classified(
         self,
@@ -290,60 +492,89 @@ class LongTerm:
         slot_hint = slot_hint or ""
 
         dedup_threshold = float(getattr(self.cfg, "memory_consolidation_dedup", 0.95) or 0.95)
+        fact_keys = {tag for tag in tags if tag.startswith("factkey:")}
+        if fact_keys:
+            with self._lock:
+                for idx, existing in enumerate(self.items):
+                    if existing.status != "active" or not fact_keys.intersection(existing.tags):
+                        continue
+                    if existing.content == content:
+                        return False
+                    # Revise the same atomic fact with CAS + transactional outbox.
+                    # Old versions remain in outbox provenance; cache changes only after commit.
+                    repo = self.inf.repo.ltm
+                    if not callable(getattr(repo, "update_committed", None)):
+                        raise MemoryCommitError("atomic fact correction requires a transactional repository")
+                    proposed = self._copy_item(existing)
+                    proposed.content = content
+                    proposed.embedding = list(emb or [])
+                    proposed.importance = float(importance)
+                    committed = self._repo_call("update_committed", existing.id, content, importance,
+                        list(emb or []), expected_version=existing.version)
+                    self.items[idx] = self._item_from_committed(committed, proposed)
+                    return False
 
-        if emb and self.items:
-            best_idx = -1
-            best_sim = -1.0
-            for idx, existing in enumerate(self.items):
-                if existing.status != "active":
-                    continue
-                if not existing.embedding or len(existing.embedding) != len(emb):
-                    continue
-                sim = self._cosine_similarity(emb, existing.embedding)
-                if sim > best_sim:
-                    best_sim = sim
-                    best_idx = idx
-            if best_idx >= 0 and best_sim >= dedup_threshold:
-                target = self.items[best_idx]
-                if importance > target.importance:
-                    target.importance = importance
-                if tags:
-                    merged: List[str] = []
-                    seen = set()
-                    for t in list(target.tags) + list(tags):
-                        if not t or t in seen:
-                            continue
-                        seen.add(t)
-                        merged.append(t)
-                    target.tags = merged
-                if category and (target.category == "" or target.category == "general"):
-                    target.category = category
-                if slot_hint and target.slot_hint == "":
-                    target.slot_hint = slot_hint
-                target.last_accessed = time.time()
-                if target.id is not None:
-                    try:
-                        self.inf.repo.ltm.update_classified(
-                            target.id,
-                            target.importance,
-                            target.tags,
-                            target.category,
-                            target.slot_hint,
-                            target.last_accessed,
+        if emb:
+            with self._lock:
+                best_idx = -1
+                best_sim = -1.0
+                for idx, existing in enumerate(self.items):
+                    if existing.status != "active":
+                        continue
+                    existing_keys = {tag for tag in existing.tags if tag.startswith("factkey:")}
+                    if fact_keys or existing_keys:
+                        continue  # Distinct factual slots must never merge by cosine alone.
+                    if not existing.embedding or len(existing.embedding) != len(emb):
+                        continue
+                    sim = self._cosine_similarity(emb, existing.embedding)
+                    if sim > best_sim:
+                        best_sim = sim
+                        best_idx = idx
+                if best_idx >= 0 and best_sim >= dedup_threshold:
+                    target = self.items[best_idx]
+                    if target.id is None:
+                        raise MemoryCommitError(
+                            "memorytx: cannot update an uncommitted cached memory"
                         )
-                    except Exception as e:
-                        logger.warning("⚠️  store_classified update_classified 失败: %s", e)
+                    proposed = self._copy_item(target)
+                    proposed.importance = max(proposed.importance, float(importance))
+                    if tags:
+                        proposed.tags = list(
+                            dict.fromkeys(
+                                tag for tag in [*proposed.tags, *tags] if tag
+                            )
+                        )
+                    if category and (proposed.category == "" or proposed.category == "general"):
+                        proposed.category = category
+                    if slot_hint and proposed.slot_hint == "":
+                        proposed.slot_hint = slot_hint
+                    proposed.last_accessed = time.time()
+
+                    # Keep the cache unchanged while the authoritative row and
+                    # its outbox events are being committed.  The version CAS
+                    # prevents a stale local candidate from overwriting a
+                    # concurrent writer.
+                    committed = self._commit_classified_update(
+                        proposed, expected_version=int(target.version or 1)
+                    )
+                    self.items[best_idx] = committed
+
+                else:
+                    committed = None
+            if committed is not None:
                 if self.graph_memory is not None:
                     try:
-                        self.graph_memory.update_node(target)
+                        self.graph_memory.update_node(committed)
                     except Exception as e:
                         logger.warning("⚠️  graph_memory.update_node 失败: %s", e)
                 _publish_event(self.inf, "memory.longterm.update", {
-                    "id": target.id,
-                    "importance": target.importance,
-                    "category": target.category,
-                    "tags": target.tags,
-                    "slot_hint": target.slot_hint,
+                    "id": committed.id,
+                    "importance": committed.importance,
+                    "category": committed.category,
+                    "tags": committed.tags,
+                    "slot_hint": committed.slot_hint,
+                    "version": committed.version,
+                    "content_hash": committed.content_hash,
                     "reason": "classified_dedup",
                 })
                 return False
@@ -353,7 +584,7 @@ class LongTerm:
             content=content,
             importance=importance,
             embedding=list(emb) if emb else None,
-            id=self._next_id,
+            id=None,
             created_at=now_ts,
             last_accessed=now_ts,
             category=category if category else "general",
@@ -361,49 +592,49 @@ class LongTerm:
             slot_hint=slot_hint,
             score=0.0,
         )
-        self._next_id += 1
-        prior = list(self.items)
-        self.items.append(new_item)
-        self._items_since_last += 1
-        emb_json = json.dumps(new_item.embedding) if new_item.embedding else "null"
-        try:
-            pg_id = self.inf.repo.ltm.save(
-                content,
-                importance,
-                emb_json,
-                created_at=now_ts,
-                last_accessed=now_ts,
-                category=new_item.category,
-                tags=new_item.tags,
-                slot_hint=new_item.slot_hint,
-                score=new_item.score,
-            )
-            if isinstance(pg_id, int) and pg_id > 0:
-                new_item.id = pg_id
-                if pg_id >= self._next_id:
-                    self._next_id = pg_id + 1
-        except Exception as e:
-            logger.warning("⚠️  store_classified save 失败: %s", e)
+        committed = self._commit_create(new_item)
+        with self._lock:
+            prior = [self._copy_item(existing) for existing in self.items]
+            self.items.append(committed)
+            self._items_since_last += 1
+            self._next_id = max(self._next_id, int(committed.id) + 1)
 
         if self.graph_memory is not None:
             try:
-                self.graph_memory.add_to_graph(new_item, neighbors=prior[-50:])
+                self.graph_memory.add_to_graph(committed, neighbors=prior[-50:])
             except Exception as e:
                 logger.warning("⚠️  graph_memory.add_to_graph 失败: %s", e)
         _publish_event(self.inf, "memory.longterm.add", {
-            "id": new_item.id,
+            "id": committed.id,
             "content": content,
             "importance": importance,
-            "category": new_item.category,
-            "tags": new_item.tags,
-            "slot_hint": new_item.slot_hint,
+            "category": committed.category,
+            "tags": committed.tags,
+            "slot_hint": committed.slot_hint,
+            "version": committed.version,
+            "content_hash": committed.content_hash,
             "reason": "classified",
         })
         return True
 
+    def _repo_call(self, method_name: str, *args, **kwargs):
+        """Pass user_id to modern repositories while keeping test doubles compatible."""
+        method = getattr(self.inf.repo.ltm, method_name)
+        try:
+            parameters = inspect.signature(method).parameters.values()
+            supports_user = any(
+                parameter.name == "user_id" or parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters
+            )
+        except (TypeError, ValueError):
+            supports_user = False
+        if supports_user:
+            kwargs["user_id"] = self.user_id
+        return method(*args, **kwargs)
+
     def recall(self, query: str, top_k: int = 3) -> List[Item]:
         active = [item for item in self.items if item.status == "active"]
-        if not active:
+        if not active or top_k <= 0:
             return []
 
         query_emb = None
@@ -414,18 +645,35 @@ class LongTerm:
                 logger.warning("⚠️  查询向量化失败: %s", e)
                 query_emb = None
 
-        if not query_emb:
-            return [self._copy_item(item) for item in active[:top_k]]
+        if query_emb:
+            from .fast_vector_index import FastVectorIndex
+            top_scored = FastVectorIndex.search_top_k(
+                query_emb,
+                active,
+                top_k=top_k,
+                threshold=0.4,
+                semantic_weight=0.7,
+                importance_weight=0.3,
+            )
+            return [self._copy_item(item, score=score) for item, score in top_scored]
+
+        # 向量模型不可用时安全降级：采用词法重合度过滤，严禁无脑截取无关早期历史
+        q_tokens = set(_tokenize_zh(query))
+        if not q_tokens:
+            return []
 
         scored: List[tuple] = []
         for item in active:
-            if item.embedding:
-                sim = self._cosine_similarity(query_emb, item.embedding)
+            item_tokens = set(_tokenize_zh(item.content))
+            overlap = len(q_tokens & item_tokens)
+            if overlap > 0:
+                sim = overlap / max(len(q_tokens | item_tokens), 1)
                 score = sim * 0.7 + item.importance * 0.3
-                scored.append((item, score))
+                if score >= 0.4:
+                    scored.append((item, score))
 
         scored.sort(key=lambda x: x[1], reverse=True)
-        return [self._copy_item(item, score=score) for item, score in scored[:top_k] if score >= 0.4]
+        return [self._copy_item(item, score=score) for item, score in scored[:top_k]]
 
     def recall_by_filter(
         self,
@@ -553,15 +801,148 @@ class LongTerm:
         这一步不物理删除旧记忆，方便审计和后续同步；默认 recall / filter
         只返回 active 条目，所以已取代事实不会继续进入提示词。
         """
+        repo = getattr(getattr(self.inf, "repo", None), "ltm", None)
+        if repo is not None and hasattr(repo, "mark_superseded_committed"):
+            old_set = {int(value) for value in old_ids if value is not None}
+            old_set.discard(int(new_id))
+            if not old_set:
+                return []
+            with self._lock:
+                by_id = {
+                    int(item.id): self._copy_item(item)
+                    for item in self.items
+                    if item.id is not None
+                }
+                marked = sorted(
+                    item_id
+                    for item_id in old_set
+                    if item_id in by_id and by_id[item_id].status != "superseded"
+                )
+                if not marked:
+                    return []
+                if int(new_id) not in by_id:
+                    raise MemoryCommitError("memorytx: superseding memory is not cached")
+                expected_versions = {
+                    item_id: max(1, int(by_id[item_id].version or 1))
+                    for item_id in [*marked, int(new_id)]
+                }
+                changes = self._repo_call(
+                    "mark_superseded_committed",
+                    marked,
+                    int(new_id),
+                    expected_versions=expected_versions,
+                )
+                if not isinstance(changes, CommittedChangeSet):
+                    raise MemoryCommitError(
+                        "memorytx: invalid committed supersession result"
+                    )
+                try:
+                    self.apply_committed(changes)
+                except MemoryCommitError:
+                    self.load_from_storage(strict=True)
+                # superseded_by is a compatibility/UI reverse pointer and is
+                # not in the portable Go projection record/hash.
+                for item in self.items:
+                    if item.id in marked:
+                        item.superseded_by = int(new_id)
+            return marked
+        if repo is not None and (
+            hasattr(repo, "set_status_committed") or hasattr(repo, "set_status")
+        ):
+            return self.set_status_committed(
+                old_ids,
+                "superseded",
+                superseded_by=int(new_id) if new_id is not None else None,
+            )
+
+        # Compatibility for isolated domain tests without a repository.  Real
+        # application repositories always take the transactional branch above.
         with self._lock:
             marked: List[int] = []
             old_set = {int(x) for x in old_ids if x is not None}
+            now = time.time()
             for item in self.items:
                 if item.id in old_set and item.status == "active":
                     item.status = "superseded"
                     item.superseded_by = int(new_id) if new_id is not None else None
-                    marked.append(item.id)
+                    item.superseded_at = now
+                    marked.append(int(item.id))
+            if new_id is not None and marked:
+                for item in self.items:
+                    if item.id == int(new_id):
+                        item.supersedes = list(
+                            dict.fromkeys([*item.supersedes, *marked])
+                        )
+                        break
             return marked
+
+    def set_status_committed(
+        self,
+        ids: List[int],
+        status: str,
+        *,
+        reason: str = "",
+        superseded_by: Optional[int] = None,
+    ) -> List[int]:
+        """Persist a status transition before publishing it to the cache."""
+
+        if status not in {"active", "quarantined", "superseded"}:
+            raise ValueError(f"unsupported memory status: {status}")
+        wanted = {int(value) for value in ids if value is not None}
+        if not wanted:
+            return []
+        with self._lock:
+            indexed = {
+                int(item.id): (index, self._copy_item(item))
+                for index, item in enumerate(self.items)
+                if item.id is not None and int(item.id) in wanted and item.status != status
+            }
+            if not indexed:
+                return []
+            expected_versions = {
+                item_id: int(item.version or 1) for item_id, (_index, item) in indexed.items()
+            }
+            method_name = (
+                "set_status_committed"
+                if hasattr(self.inf.repo.ltm, "set_status_committed")
+                else "set_status"
+            )
+            kwargs = {
+                "reason": reason,
+                "superseded_by": superseded_by,
+            }
+            if method_name == "set_status_committed":
+                kwargs["expected_versions"] = expected_versions
+            result = self._repo_call(method_name, sorted(indexed), status, **kwargs)
+            committed_by_id: Dict[int, Item] = {}
+            if result is not None:
+                for value in result:
+                    fallback = indexed[int(getattr(value, "memory_id", getattr(value, "id", -1)))][1]
+                    committed = self._item_from_committed(value, fallback)
+                    committed.status = status
+                    committed.quarantine_reason = reason or ""
+                    committed.superseded_by = superseded_by
+                    committed.superseded_at = (
+                        committed.superseded_at or time.time()
+                        if status == "superseded"
+                        else None
+                    )
+                    committed_by_id[int(committed.id)] = committed
+            else:
+                # Legacy repository: a normal return still means the call
+                # completed.  Synthesize only after that return, never before.
+                for item_id, (_index, fallback) in indexed.items():
+                    fallback.status = status
+                    fallback.quarantine_reason = reason or ""
+                    fallback.superseded_by = superseded_by
+                    fallback.superseded_at = time.time() if status == "superseded" else None
+                    fallback.version = expected_versions[item_id] + 1
+                    committed_by_id[item_id] = fallback
+            if set(committed_by_id) != set(indexed):
+                raise MemoryCommitError("memorytx: status commit returned an incomplete change set")
+            for item_id, (index, _fallback) in indexed.items():
+                self.items[index] = committed_by_id[item_id]
+        return sorted(committed_by_id)
 
     def active_items(self) -> List[Item]:
         """返回 active 状态的长期记忆副本。"""
@@ -645,6 +1026,211 @@ class LongTerm:
         with self._lock:
             self.cfg = cfg
 
+    def _record_from_item(self, item: Item) -> MemoryRecord:
+        record = MemoryRecord(
+            memory_id=int(item.id or 0),
+            user_id=self.user_id,
+            content=item.content,
+            importance=float(item.importance),
+            embedding=list(item.embedding or []),
+            category=item.category or "general",
+            tags=list(item.tags or []),
+            slot_hint=item.slot_hint or "",
+            version=max(1, int(item.version or 1)),
+            content_hash=item.content_hash or "",
+            created_at=float(item.created_at or 0.0),
+            updated_at=float(item.updated_at or 0.0),
+            last_accessed=float(item.last_accessed or 0.0),
+            deleted_at=item.deleted_at,
+            quarantined=item.status == "quarantined",
+            quarantine_reason=item.quarantine_reason or "",
+            superseded=item.status == "superseded",
+            superseded_at=item.superseded_at,
+            supersedes=list(item.supersedes or []),
+        )
+        record.content_hash = compute_content_hash(record)
+        return record
+
+    def plan_consolidation(self, now: Optional[float] = None) -> ConsolidationPlan:
+        """Build a version-CAS plan without mutating the active cache."""
+
+        now = float(now if now is not None else time.time())
+        with self._lock:
+            items = [self._copy_item(item) for item in self.items]
+        if len(items) <= 1:
+            return ConsolidationPlan()
+
+        decay_rate = float(getattr(self.cfg, "memory_consolidation_decay_rate", 0.99) or 0.99)
+        similarity = float(getattr(self.cfg, "memory_consolidation_similarity", 0.85) or 0.85)
+        dedup = float(getattr(self.cfg, "memory_consolidation_dedup", 0.95) or 0.95)
+        ttl_days = int(getattr(self.cfg, "memory_consolidation_ttl_days", 30) or 30)
+        min_importance = float(getattr(self.cfg, "memory_consolidation_min_import", 0.1) or 0.1)
+
+        removed: Dict[int, str] = {}
+        updates: Dict[int, MemoryUpdate] = {}
+        for index, item in enumerate(items):
+            if item.id is None:
+                continue
+            days = max(0.0, (now - item.created_at) / 86400.0)
+            previous = item.importance
+            item.importance = previous * (decay_rate ** days)
+            if previous - item.importance >= 0.01:
+                updates[int(item.id)] = MemoryUpdate(
+                    self._record_from_item(item), max(1, int(item.version or 1))
+                )
+
+        for i in range(len(items)):
+            if i in removed:
+                continue
+            for j in range(i + 1, len(items)):
+                if j in removed:
+                    continue
+                left, right = items[i], items[j]
+                if any(str(tag).startswith('factkey:') for tag in (*left.tags, *right.tags)):
+                    continue  # Atomic facts are corrected at write time, not merged by similarity.
+                score = self._compute_similarity(
+                    left.content, right.content, left.embedding, right.embedding
+                )
+                if score >= dedup:
+                    remove_index = i if right.importance >= left.importance else j
+                    removed[remove_index] = "deduplicated"
+                    if items[remove_index].id is not None:
+                        updates.pop(int(items[remove_index].id), None)
+                    if remove_index == i:
+                        break
+                elif score >= similarity:
+                    survivor, remove_index = (j, i) if right.importance > left.importance else (i, j)
+                    merged = self._merge_pair(items[i], items[j], now)
+                    merged.id = items[survivor].id
+                    merged.version = items[survivor].version
+                    items[survivor] = merged
+                    removed[remove_index] = "merged"
+                    if items[remove_index].id is not None:
+                        updates.pop(int(items[remove_index].id), None)
+                    if merged.id is not None:
+                        updates[int(merged.id)] = MemoryUpdate(
+                            self._record_from_item(merged),
+                            max(1, int(merged.version or 1)),
+                        )
+                    if remove_index == i:
+                        break
+
+        for index, item in enumerate(items):
+            if index in removed:
+                continue
+            days = max(0.0, (now - item.created_at) / 86400.0)
+            if ttl_days > 0 and days > float(ttl_days) and item.importance < min_importance:
+                removed[index] = "expired"
+                if item.id is not None:
+                    updates.pop(int(item.id), None)
+
+        if self.graph_memory is not None and removed:
+            candidates = [
+                int(items[index].id)
+                for index in removed
+                if items[index].id is not None
+            ]
+            try:
+                threshold = int(getattr(self.cfg, "graph_protect_indegree", 3) or 3)
+                protected = set(
+                    self.graph_memory.filter_protected(candidates, threshold) or []
+                )
+                for index in list(removed):
+                    if items[index].id in protected:
+                        removed.pop(index, None)
+            except Exception as exc:
+                logger.warning("⚠️  graph_memory.filter_protected 失败: %s", exc)
+
+        deletes = [
+            MemoryDelete(
+                memory_id=int(items[index].id),
+                user_id=self.user_id,
+                expected_version=max(1, int(items[index].version or 1)),
+                reason=reason,
+            )
+            for index, reason in removed.items()
+            if items[index].id is not None
+        ]
+        return ConsolidationPlan(
+            updates=sorted(updates.values(), key=lambda value: value.record.memory_id),
+            deletes=sorted(deletes, key=lambda value: value.memory_id),
+        )
+
+    def apply_committed(self, changes: CommittedChangeSet) -> None:
+        """Atomically apply already-committed authoritative rows to the cache."""
+
+        upserts = list(getattr(changes, "upserts", []) or [])
+        deletes = list(getattr(changes, "deletes", []) or [])
+        if any(record.user_id != self.user_id for record in [*upserts, *deletes]):
+            raise MemoryCommitError("memorytx: committed change set crossed tenant boundary")
+        with self._lock:
+            next_items = [self._copy_item(item) for item in self.items]
+            by_id = {
+                int(item.id): index
+                for index, item in enumerate(next_items)
+                if item.id is not None
+            }
+            for record in upserts:
+                index = by_id.get(int(record.memory_id))
+                if index is None or int(next_items[index].version or 1) != record.version - 1:
+                    raise MemoryCommitError("memorytx: cache version changed after commit")
+                next_items[index] = self._item_from_committed(record, next_items[index])
+            deleted_ids = set()
+            for record in deletes:
+                index = by_id.get(int(record.memory_id))
+                if index is None or int(next_items[index].version or 1) != record.version - 1:
+                    raise MemoryCommitError("memorytx: cache version changed after commit")
+                deleted_ids.add(int(record.memory_id))
+            self.items = [
+                item for item in next_items
+                if item.id is None or int(item.id) not in deleted_ids
+            ]
+            self._next_id = max(
+                [int(item.id) + 1 for item in self.items if item.id is not None] or [0]
+            )
+
+    def consolidate_committed(self) -> ConsolidationResult:
+        """Persist one consolidation plan atomically, then update the cache."""
+
+        plan = self.plan_consolidation()
+        if not plan.updates and not plan.deletes:
+            return ConsolidationResult()
+        repo = getattr(getattr(self.inf, "repo", None), "ltm", None)
+        if repo is None or not hasattr(repo, "apply_consolidation_committed"):
+            raise MemoryCommitError("memorytx: consolidation repository unavailable")
+        changes = self._repo_call("apply_consolidation_committed", plan)
+        if not isinstance(changes, CommittedChangeSet):
+            raise MemoryCommitError("memorytx: invalid committed consolidation result")
+        try:
+            self.apply_committed(changes)
+        except MemoryCommitError:
+            # PostgreSQL already committed.  Reloading is the only safe answer
+            # when another local mutation raced cache application.
+            self.load_from_storage(strict=True)
+        with self._lock:
+            self._last_consolidate_ts = time.time()
+            self._items_since_last = 0
+        reasons = {entry.reason for entry in plan.deletes}
+        result = ConsolidationResult(
+            deduped=sum(entry.reason == "deduplicated" for entry in plan.deletes),
+            merged=sum(entry.reason == "merged" for entry in plan.deletes),
+            expired=sum(entry.reason == "expired" for entry in plan.deletes),
+            delete_from_db=[entry.memory_id for entry in plan.deletes],
+            update_in_db=[
+                self._item_from_committed(update.record, Item(content=update.record.content))
+                for update in plan.updates
+            ],
+        )
+        _publish_event(self.inf, "memory.consolidate", {
+            "deduped": result.deduped,
+            "merged": result.merged,
+            "expired": result.expired,
+            "delete_from_db": result.delete_from_db,
+            "update_count": len(result.update_in_db),
+            "committed": True,
+        })
+        return result
+
     def consolidate(self) -> ConsolidationResult:
         """周期性合并：阶段 1 衰减 → 阶段 2 去重/合并 → 阶段 3 双条件淘汰。
 
@@ -690,6 +1276,8 @@ class LongTerm:
                         continue
                     item_i = self.items[i]
                     item_j = self.items[j]
+                    if any(str(tag).startswith('factkey:') for tag in (*item_i.tags, *item_j.tags)):
+                        continue
                     sim = self._compute_similarity(
                         item_i.content,
                         item_j.content,
@@ -775,52 +1363,68 @@ class LongTerm:
         return result
 
     def _merge_pair(self, item_i: Item, item_j: Item, now: float) -> Item:
-        """合并 i / j 为一条新 Item（按用户描述：内容用'；'拼接、emb 重要性加权
-        平均、importance 取 max、tags dedup 合并、category/slot_hint 取 i 优先、
-        last_accessed=now、created_at 取更早）。返回新 Item，沿用 i 的 id。"""
-        # 内容拼接
-        content = f"{item_i.content}；{item_j.content}"
+        """Pure Go-parity merge retaining the stronger record's identity."""
 
-        # embedding 加权平均（分母为 0 时回退到 i 的 emb）
+        base, other = (
+            (item_j, item_i)
+            if item_j.importance > item_i.importance
+            else (item_i, item_j)
+        )
+        if other.content not in base.content and base.content not in other.content:
+            content = f"{base.content}；{other.content}"
+        elif len(other.content) > len(base.content):
+            content = other.content
+        else:
+            content = base.content
+
         emb: Optional[List[float]] = None
         if (
-            item_i.embedding
-            and item_j.embedding
-            and len(item_i.embedding) == len(item_j.embedding)
+            base.embedding
+            and other.embedding
+            and len(base.embedding) == len(other.embedding)
         ):
-            wi = item_i.importance
-            wj = item_j.importance
+            wi = base.importance
+            wj = other.importance
             total = wi + wj
             if total > 0:
                 emb = [
-                    (item_i.embedding[k] * wi + item_j.embedding[k] * wj) / total
-                    for k in range(len(item_i.embedding))
+                    (base.embedding[k] * wi + other.embedding[k] * wj) / total
+                    for k in range(len(base.embedding))
                 ]
             else:
-                emb = list(item_i.embedding)
-        elif item_i.embedding:
-            emb = list(item_i.embedding)
-        elif item_j.embedding:
-            emb = list(item_j.embedding)
+                emb = list(base.embedding)
+        elif base.embedding:
+            emb = list(base.embedding)
+        elif other.embedding:
+            emb = list(other.embedding)
 
-        tags = list(dict.fromkeys(list(item_i.tags) + list(item_j.tags)))
-        category = item_i.category if item_i.category else item_j.category
-        slot_hint = item_i.slot_hint if item_i.slot_hint else item_j.slot_hint
+        tags = list(dict.fromkeys([*base.tags, *other.tags]))
+        supersedes = list(
+            dict.fromkeys(
+                [*base.supersedes, *([int(other.id)] if other.id is not None else []), *other.supersedes]
+            )
+        )
 
         return Item(
             content=content,
-            importance=max(item_i.importance, item_j.importance),
+            importance=max(base.importance, other.importance),
             embedding=emb,
-            id=item_i.id,
-            created_at=min(item_i.created_at, item_j.created_at),
+            id=base.id,
+            created_at=base.created_at,
             last_accessed=now,
-            category=category,
+            category=base.category,
             tags=tags,
-            slot_hint=slot_hint,
-            score=item_i.score,
-            status=item_i.status,
-            superseded_by=item_i.superseded_by,
-            quarantine_reason=item_i.quarantine_reason,
+            slot_hint=base.slot_hint,
+            score=base.score,
+            status=base.status,
+            superseded_by=base.superseded_by,
+            superseded_at=base.superseded_at,
+            supersedes=supersedes,
+            quarantine_reason=base.quarantine_reason,
+            version=base.version,
+            content_hash=base.content_hash,
+            updated_at=base.updated_at,
+            deleted_at=base.deleted_at,
         )
 
     def _compute_similarity(
@@ -892,7 +1496,7 @@ class MemoryManager:
         self.cfg = cfg
         self.inf = inf
         self.short_term = ShortTerm(cfg.short_term_max_turns)
-        self.long_term = LongTerm(cfg, inf)
+        self.long_term = LongTerm(cfg, inf, user_id=user_id)
         self.preference = Preference(user_id, inf)
         # 可选注入点：可以构造时传入，也可以后续 set_graph_memory() 注入
         self.graph_memory: Optional["GraphMemory"] = graph_memory

@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from config.config import APIConfig
 from internal.agent.agent import Response
 from internal.handler.handler import setup_routes
+from internal.rag.splitter import RecursiveSplitter
 from internal.tools.tools import Tool
 
 
@@ -191,6 +192,39 @@ def test_upload_accepts_main_frontend_json_payload():
     assert data["doc_hash"]
 
 
+def test_rag_lab_endpoint_returns_explainable_pipeline_without_ingesting():
+    agent = _Agent()
+    agent.rag = SimpleNamespace(
+        parent_splitter=RecursiveSplitter(120, 10),
+        child_splitter=RecursiveSplitter(50, 8),
+        _llm=SimpleNamespace(embed_batch=lambda texts: [[1.0, 0.0] for _ in texts]),
+        _generate_fn=lambda _system, _user: "一期预算为 320 万元。",
+        user_id="default_user",
+        _hybrid=None,
+        _check_existing_chunks=lambda: None,
+    )
+    status, payload = _request(
+        _client_for(agent),
+        "POST",
+        "/api/rag/lab/run",
+        json.dumps(
+            {
+                "document": "星槎-47 一期预算为 320 万元，计划在 2026 年 9 月启动。",
+                "query": "一期预算是多少？",
+                "top_k": 3,
+            }
+        ).encode(),
+    )
+
+    assert status == 200
+    data = json.loads(payload)
+    assert [stage["id"] for stage in data["stages"]] == [
+        "split", "query", "retrieve", "augment", "generate"
+    ]
+    assert data["answer"] == "一期预算为 320 万元。"
+    assert agent.uploaded == ""
+
+
 def test_upload_accepts_legacy_int_rag_ingest_result():
     status, payload = _request(
         _legacy_upload_client(),
@@ -355,3 +389,50 @@ def test_frontend_uses_completion_badges_instead_of_interrupted_for_successful_d
     assert "检索完成" in html
     assert "本次回复已取消" in html
     assert "✦ 已中断" not in html
+
+
+def test_evaluation_dashboard_distinguishes_replay_from_live_execution():
+    component = Path("web/src/components/EvaluationDashboard.vue").read_text(
+        encoding="utf-8"
+    )
+    store = Path("web/src/stores/evaluation.js").read_text(encoding="utf-8")
+
+    assert "运行腾讯岗位演示" not in component
+    assert "运行合成回放" in component
+    assert "运行本地智能体实测" in component
+    assert "不会调用真实模型、工具或 RAG" in component
+    assert "100%" in component
+    assert "不代表真实智能体效果" in component
+    assert "/api/eval/readiness" in store
+    assert "/api/eval/demo/bootstrap" in store
+    assert "/api/eval/demo/live" in store
+
+
+def test_evaluation_dashboard_uses_dynamic_progress_and_semantic_trace_fields():
+    component = Path("web/src/components/EvaluationDashboard.vue").read_text(
+        encoding="utf-8"
+    )
+
+    assert "正在执行 12 条用例" not in component
+    assert "operationCompleted" in component
+    assert "operationTotal" in component
+    assert "activeOperation" in component
+    assert "${operationCompleted.value}/${operationTotal.value}" in component
+    assert '<dl v-if="traceFields(event).length"' in component
+    assert "此步骤没有附加数据" in component
+    assert "<pre" not in component
+    assert "pretty(" not in component
+
+
+def test_medical_agent_ui_explains_execution_in_chinese_and_exposes_real_trace():
+    component = Path("web/src/components/MedicalDashboard.vue").read_text(
+        encoding="utf-8"
+    )
+
+    assert "智慧云诊室 · 临床辅助决策工作台" in component
+    assert "Clinical Decision Support System (CDSS)" in component
+    assert "三栏临床工作台" in component
+    assert "多专家会诊流" in component
+    assert "独立工具箱" in component
+    assert "S0/S1 拦截门禁在线" in component
+

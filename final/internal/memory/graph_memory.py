@@ -1,6 +1,6 @@
 # graph_memory — 长期记忆与 Neo4j 知识图谱的双向同步层。
 #
-# 节点类型：(:Memory {mem_id, content, importance})
+# 节点类型：(:Memory {user_id, mem_id, content, importance})
 # 边类型：
 #   FOLLOWS      — 时序相邻（上一条对话记忆 → 当前）
 #   SIMILAR_TO   — 语义相似度超阈值（Store 时自动连接）
@@ -58,9 +58,14 @@ class GraphMemory:
         llm: Optional[Any] = None,
         sim_threshold: float = 0.7,
         ltm: Optional[Any] = None,
+        *,
+        user_id: str,
     ):
+        if not isinstance(user_id, str) or not user_id.strip():
+            raise ValueError("GraphMemory requires a non-empty user_id")
         self.cfg = cfg
         self.neo = neo
+        self.user_id = user_id
         self.llm = llm
         self.sim_thresh = sim_threshold if sim_threshold > 0 else 0.7
         self.prev_id: int = -1
@@ -92,9 +97,14 @@ class GraphMemory:
             return
         try:
             self.neo.run_cypher(
-                """MERGE (m:Memory {mem_id: $id})
+                """MERGE (m:Memory {user_id: $user_id, mem_id: $id})
                  SET m.content = $content, m.importance = $importance""",
-                {"id": int(mem_id), "content": content, "importance": float(importance)},
+                {
+                    "user_id": self.user_id,
+                    "id": int(mem_id),
+                    "content": content,
+                    "importance": float(importance),
+                },
             )
         except Exception as e:
             logger.warning("⚠️  Neo4j upsertMemoryNode 失败 (id=%s): %s", mem_id, e)
@@ -109,14 +119,20 @@ class GraphMemory:
             logger.warning("⚠️  非法的边类型: %s", edge_type)
             return
         query = (
-            "MATCH (a:Memory {mem_id: $from}), (b:Memory {mem_id: $to}) "
-            "MERGE (a)-[r:" + edge_type + "]->(b) "
+            "MATCH (a:Memory {user_id: $user_id, mem_id: $from}), "
+            "(b:Memory {user_id: $user_id, mem_id: $to}) "
+            "MERGE (a)-[r:" + edge_type + " {user_id: $user_id}]->(b) "
             "SET r.weight = $weight"
         )
         try:
             self.neo.run_cypher(
                 query,
-                {"from": int(from_id), "to": int(to_id), "weight": float(weight)},
+                {
+                    "user_id": self.user_id,
+                    "from": int(from_id),
+                    "to": int(to_id),
+                    "weight": float(weight),
+                },
             )
         except Exception as e:
             logger.warning("⚠️  Neo4j addMemoryEdge 失败 (%s→%s): %s", from_id, to_id, e)
@@ -127,13 +143,18 @@ class GraphMemory:
             return []
         hop_str = "1" if hops <= 1 else "1.." + str(hops)
         query = (
-            "MATCH (m:Memory) WHERE m.mem_id IN $ids "
-            "MATCH (m)-[:FOLLOWS|SIMILAR_TO|CAUSES|BELONGS_TO*" + hop_str + "]-(n:Memory) "
-            "WHERE NOT n.mem_id IN $ids "
+            "MATCH (m:Memory {user_id: $user_id}) WHERE m.mem_id IN $ids "
+            "MATCH p=(m)-[:FOLLOWS|SIMILAR_TO|CAUSES|BELONGS_TO*" + hop_str + "]-(n:Memory) "
+            "WHERE n.user_id = $user_id AND NOT n.mem_id IN $ids "
+            "AND ALL(node IN nodes(p) WHERE node:Memory AND node.user_id = $user_id) "
+            "AND ALL(rel IN relationships(p) WHERE rel.user_id = $user_id) "
             "RETURN DISTINCT n.mem_id AS id"
         )
         try:
-            records = self.neo.run_cypher(query, {"ids": [int(i) for i in seed_ids]})
+            records = self.neo.run_cypher(
+                query,
+                {"user_id": self.user_id, "ids": [int(i) for i in seed_ids]},
+            )
         except Exception as e:
             logger.warning("⚠️  Neo4j expandMemoryNeighbors 失败: %s", e)
             return []
@@ -148,13 +169,22 @@ class GraphMemory:
         return result
 
     def _delete_memory_node(self, mem_id: int) -> None:
-        """删除一条记忆节点及其所有边。"""
+        """删除当前租户的一条记忆及其当前租户边；异常跨租户边时拒绝删节点。"""
         if not self._available():
             return
         try:
             self.neo.run_cypher(
-                "MATCH (m:Memory {mem_id: $id}) DETACH DELETE m",
-                {"id": int(mem_id)},
+                "MATCH (m:Memory {user_id: $user_id, mem_id: $id})"
+                "-[r {user_id: $user_id}]-"
+                "(n:Memory {user_id: $user_id}) DELETE r",
+                {"user_id": self.user_id, "id": int(mem_id)},
+            )
+            # 不用 DETACH DELETE：若存在无租户或其他租户的异常边，保留节点并让
+            # Neo4j 拒绝删除，避免本租户操作连带删除不属于它的关系。
+            self.neo.run_cypher(
+                "MATCH (m:Memory {user_id: $user_id, mem_id: $id}) "
+                "WHERE NOT (m)--() DELETE m",
+                {"user_id": self.user_id, "id": int(mem_id)},
             )
         except Exception as e:
             logger.warning("⚠️  Neo4j deleteMemoryNode 失败 (id=%s): %s", mem_id, e)
@@ -164,15 +194,20 @@ class GraphMemory:
         if not self._available() or not candidates:
             return []
         query = (
-            "MATCH (m:Memory) WHERE m.mem_id IN $ids "
-            "WITH m, size([(m)<-[]-() | 1]) AS indegree "
+            "MATCH (m:Memory {user_id: $user_id}) WHERE m.mem_id IN $ids "
+            "WITH m, size([(m)<-[r]-(source:Memory) "
+            "WHERE r.user_id = $user_id AND source.user_id = $user_id | 1]) AS indegree "
             "WHERE indegree >= $threshold "
             "RETURN m.mem_id AS id"
         )
         try:
             records = self.neo.run_cypher(
                 query,
-                {"ids": [int(i) for i in candidates], "threshold": int(threshold)},
+                {
+                    "user_id": self.user_id,
+                    "ids": [int(i) for i in candidates],
+                    "threshold": int(threshold),
+                },
             )
         except Exception as e:
             logger.warning("⚠️  Neo4j getHighCentrality 失败: %s", e)

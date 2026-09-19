@@ -36,6 +36,7 @@ class ExecRequest:
     command: str = ""
     timeout: float = 0.0  # 秒；0 表示使用 sandbox 默认值
     confirm: bool = False  # 对 warn 级命令的二次确认
+    workspace_host_dir: str = ""  # 可选：绑定挂载到容器 /workspace
 
 
 @dataclass

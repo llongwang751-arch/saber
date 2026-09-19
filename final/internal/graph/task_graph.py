@@ -1,11 +1,11 @@
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List
+from typing import Any, Dict, List
 
 
 class NodeType(str, Enum):
     TOOL = "tool"
-    SUBAGENT = "subagent"
+    SUBAGENT = "sub_agent"
     LLM = "llm"
     THINK = "think"
     AGGREGATE = "aggregate"
@@ -26,8 +26,9 @@ class Node:
     type: NodeType = NodeType.TOOL
     name: str = ""
     tool_name: str = ""
-    params: Dict[str, str] = field(default_factory=dict)
+    params: Dict[str, Any] = field(default_factory=dict)
     depends_on: List[str] = field(default_factory=list)
+    optional_depends_on: List[str] = field(default_factory=list)
     race_group: str = ""
     status: NodeStatus = NodeStatus.PENDING
     result: str = ""
@@ -53,6 +54,12 @@ class TaskGraph:
             for dep in node.depends_on or []:
                 if dep not in self.nodes:
                     raise ValueError(f"missing dependency {dep} for node {node.id}")
+            unknown_optional = set(node.optional_depends_on or []) - set(node.depends_on or [])
+            if unknown_optional:
+                raise ValueError(
+                    f"optional dependencies must also appear in depends_on for node {node.id}: "
+                    f"{sorted(unknown_optional)}"
+                )
         self.topological_levels()
 
     def topological_levels(self) -> List[List[str]]:
@@ -79,12 +86,32 @@ class TaskGraph:
         return levels
 
     def ready_nodes(self) -> List[str]:
+        failure_terminal = {NodeStatus.FAILED, NodeStatus.CANCELLED, NodeStatus.SKIPPED}
+        changed = True
+        while changed:
+            changed = False
+            for node in self.nodes.values():
+                if node.status != NodeStatus.PENDING:
+                    continue
+                optional = set(node.optional_depends_on or [])
+                failed_required = [
+                    dep for dep in node.depends_on
+                    if dep not in optional and self.nodes[dep].status in failure_terminal
+                ]
+                if failed_required:
+                    node.status = NodeStatus.SKIPPED
+                    node.error = "required dependency failed: " + ", ".join(sorted(failed_required))
+                    changed = True
+
         ready: List[str] = []
+        terminal = {NodeStatus.DONE, NodeStatus.FAILED, NodeStatus.CANCELLED, NodeStatus.SKIPPED}
         for node_id, node in self.nodes.items():
             if node.status != NodeStatus.PENDING:
                 continue
-            deps_done = all(self.nodes[dep].status == NodeStatus.DONE for dep in node.depends_on)
-            if deps_done:
+            deps_done = all(self.nodes[dep].status in terminal for dep in node.depends_on)
+            required = set(node.depends_on or []) - set(node.optional_depends_on or [])
+            required_ok = all(self.nodes[dep].status == NodeStatus.DONE for dep in required)
+            if deps_done and required_ok:
                 ready.append(node_id)
         return sorted(ready)
 
@@ -121,10 +148,21 @@ class TaskGraph:
     def successful_results(self) -> List[str]:
         return [node.result for node in self.nodes.values() if node.status == NodeStatus.DONE and node.result]
 
+    def add_nodes(self, nodes: List[Node]) -> List[str]:
+        """运行期追加重规划节点，并重建依赖索引。冲突 ID 由调用方先处理。"""
+        added: List[str] = []
+        for node in nodes:
+            if not node.id or node.id in self.nodes:
+                continue
+            self.nodes[node.id] = node
+            added.append(node.id)
+        self._rebuild_edges()
+        return added
+
     def summary(self) -> str:
         parts = []
         for node in self.nodes.values():
-            parts.append(f"{node.id}:{node.tool_name}:{node.status}")
+            parts.append(f"{node.id}:{node.tool_name}:{node.status.value}")
         return "\n".join(parts)
 
     def _check_missing_dependencies(self) -> None:
@@ -132,3 +170,12 @@ class TaskGraph:
             for dep in node.depends_on or []:
                 if dep not in self.nodes:
                     raise ValueError(f"missing dependency {dep} for node {node.id}")
+
+    def _rebuild_edges(self) -> None:
+        self.adj = {node_id: [] for node_id in self.nodes}
+        self.indegree = {node_id: 0 for node_id in self.nodes}
+        for node in self.nodes.values():
+            for dep in node.depends_on or []:
+                if dep in self.adj:
+                    self.adj[dep].append(node.id)
+                    self.indegree[node.id] += 1

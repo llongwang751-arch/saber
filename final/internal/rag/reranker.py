@@ -1,7 +1,10 @@
 import json
 import logging
+import math
 import re
 from typing import Callable, List, Optional
+
+from internal.resilience.circuit_breaker import CircuitBreaker
 
 logger = logging.getLogger(__name__)
 
@@ -11,33 +14,61 @@ GenerateFn = Callable[[str, str], str]
 class LLMReranker:
     """用一次 LLM listwise 调用对候选 chunk 精排，失败时回退原顺序。"""
 
-    def __init__(self, generate_fn: Optional[GenerateFn], preview_len: int = 200):
+    def __init__(
+        self,
+        generate_fn: Optional[GenerateFn],
+        preview_len: int = 200,
+        *,
+        failure_threshold: int = 3,
+        cooldown_seconds: float = 30.0,
+        half_open_max_calls: int = 1,
+        circuit_breaker: Optional[CircuitBreaker] = None,
+        fallback_reranker=None,
+    ):
         self.generate_fn = generate_fn
         self.preview_len = preview_len if preview_len > 0 else 200
+        self._circuit = circuit_breaker or CircuitBreaker(
+            failure_threshold=failure_threshold,
+            cooldown_seconds=cooldown_seconds,
+            half_open_max_calls=half_open_max_calls,
+        )
+        self._fallback_reranker = fallback_reranker
 
     def rerank(self, query: str, results: List, top_k: int) -> List:
         if not results:
             return []
-        if self.generate_fn is None or len(results) == 1:
+        if self.generate_fn is None:
             return _truncate(results, top_k)
+        if not self._circuit.allow_request():
+            snapshot = self._circuit.snapshot()
+            logger.warning(
+                "⚠️  Rerank 熔断器处于 %s，跳过远程调用并回退 RRF（%.1fs 后可探测）",
+                snapshot.state,
+                snapshot.retry_after_seconds,
+            )
+            return self._fallback(query, results, top_k)
 
         try:
             raw = self.generate_fn(self._system_prompt(), self._user_msg(query, results))
             scores = _parse_scores(raw)
         except Exception as e:
+            self._circuit.record_failure()
             logger.warning("⚠️  Rerank 失败，回退 RRF 顺序: %s", e)
-            return _truncate(results, top_k)
+            return self._fallback(query, results, top_k)
         if not scores:
-            return _truncate(results, top_k)
+            self._circuit.record_failure()
+            logger.warning("⚠️  Rerank 未返回有效分数，回退 RRF 顺序")
+            return self._fallback(query, results, top_k)
 
         score_map = {idx: score for idx, score in scores if 0 <= idx < len(results)}
         if len(score_map) != len(results):
+            self._circuit.record_failure()
             logger.warning(
-                "⚠️  Rerank scores 数量(%d) != 候选数量(%d)，缺失项补 0、越界项截断",
+                "⚠️  Rerank scores 数量(%d) != 候选数量(%d)，回退 RRF 顺序",
                 len(score_map), len(results),
             )
-            for i in range(len(results)):
-                score_map.setdefault(i, 0.0)
+            return self._fallback(query, results, top_k)
+        self._circuit.record_success()
         ordered = []
         for idx, result in enumerate(results):
             llm_score = score_map.get(idx, 0.0)
@@ -51,6 +82,20 @@ class LLMReranker:
             result.source = f"{getattr(result, 'source', '')}+rerank"
             out.append(result)
         return _truncate(out, top_k)
+
+    def circuit_snapshot(self) -> dict:
+        """Expose operational state for structured RAG Trace and monitoring."""
+
+        return self._circuit.snapshot().to_dict()
+
+    def _fallback(self, query: str, results: List, top_k: int) -> List:
+        if self._fallback_reranker is None:
+            return _truncate(results, top_k)
+        try:
+            return self._fallback_reranker.rerank(query, results, top_k)
+        except Exception as exc:
+            logger.warning("⚠️  本地备用 Rerank 失败，回退 RRF 顺序: %s", exc)
+            return _truncate(results, top_k)
 
     def _system_prompt(self) -> str:
         return (
@@ -96,9 +141,12 @@ def _parse_scores(raw: str) -> List[tuple]:
     scores = []
     for item in items:
         try:
-            scores.append((int(item.get("idx")), float(item.get("score"))))
+            idx = int(item.get("idx"))
+            score = float(item.get("score"))
         except Exception:
             continue
+        if math.isfinite(score) and 0.0 <= score <= 10.0:
+            scores.append((idx, score))
     return scores
 
 

@@ -37,8 +37,8 @@ class Preference:
         if not key or value is None:
             return
         with self._lock:
+            self.inf.repo.preference.save(self.user_id, key, value)
             self.preferences[key] = value
-        self.inf.repo.preference.save(self.user_id, key, value)
 
     def save_batch(self, kvs: Dict[str, str]) -> None:
         for k, v in (kvs or {}).items():
@@ -58,32 +58,25 @@ class Preference:
     # ─── main 分支对齐 ─────────────────────────────────────────────────────
 
     def extract_and_save(self, msg: str) -> Tuple[str, str, bool]:
-        """从用户输入提取偏好并落库。
+        """从用户输入提取偏好与画像并落库（融合 TencentDB-Agent-Memory 槽位抽取思想）。
 
-        与 main 分支 Go ExtractAndSave 严格对齐：仅识别 "我喜欢" / "我爱" / "我叫"
-        三条规则，``strings.SplitN(msg, "X", 2)`` 取分隔符之后的部分；任一规则
-        提取出非空 value 即写入；未命中返回 ("", "", False)。
+        支持正面喜好、负面限制/忌口（否定句不被反向误读）、身份职业、输出格式等，
+        同时完全兼容原有 key/value 对齐协议。
         """
         if not msg:
             return "", "", False
 
-        rules = [
-            ("我喜欢", "喜欢", "喜好"),
-            ("我爱", "爱", "喜好"),
-            ("我叫", "叫", "姓名"),
-        ]
-        for marker, sep, key in rules:
-            if marker not in msg:
-                continue
-            parts = msg.split(sep, 1)
-            if len(parts) < 2:
-                continue
-            value = parts[1].strip()
-            if not value:
-                continue
-            self.set(key, value)
-            return key, value, True
-        return "", "", False
+        from .slot_extractor import SlotExtractor
+        slots = SlotExtractor.extract_slots(msg)
+        if not slots:
+            return "", "", False
+
+        # 将所有识别到的槽位存入偏好中
+        for slot in slots:
+            self.set(slot.key, slot.value)
+
+        primary = slots[0]
+        return primary.key, primary.value, True
 
     def build_context(self) -> str:
         """渲染【用户偏好】块；空数据返回空串。

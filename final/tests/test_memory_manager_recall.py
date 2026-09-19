@@ -65,7 +65,13 @@ class _GraphStub:
 
 def _make_mgr(graph=None):
     inf = SimpleNamespace(repo=SimpleNamespace(ltm=_LtmRepo(), preference=_PrefRepo()))
-    return MemoryManager(_Cfg(), inf, graph_memory=graph)
+    return MemoryManager(_Cfg(), inf, user_id="tenant_alpha", graph_memory=graph)
+
+
+def test_manager_propagates_tenant_to_long_term_memory():
+    mgr = _make_mgr()
+
+    assert mgr.long_term.user_id == "tenant_alpha"
 
 
 def test_recall_no_graph_returns_seed_only():

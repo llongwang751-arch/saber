@@ -61,6 +61,7 @@ def status(agent) -> Dict[str, Any]:
         "long_term_count": len(getattr(ltm, "items", []) or []) if ltm else 0,
         "preferences": pref.get_all() if pref and hasattr(pref, "get_all") else {},
         "tools_count": len(tools),
+        "sub_agents_count": len(agent.subagents.snapshot()) if hasattr(agent, "subagents") else 0,
         "llm_model": getattr(agent.cfg, "llm_model", ""),
         "embedding_model": getattr(agent.cfg, "embedding_model", ""),
         "is_mock": not bool(agent.cfg.is_real_llm()) if hasattr(agent.cfg, "is_real_llm") else True,

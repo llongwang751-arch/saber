@@ -61,6 +61,29 @@ def _parse_pdf(filename: str, content_type: str, data: bytes) -> ParseResult:
     raise ValueError("pdf contains no extractable text; OCR is required")
 
 
+def _format_table_to_markdown(table: list) -> str:
+    """Convert extracted 2D table grid into a clean Markdown table (inspired by WeKnora)."""
+    if not table or not table[0]:
+        return ""
+    cleaned_table = []
+    for row in table:
+        cleaned_table.append([(str(cell or "")).replace("\n", " ").strip() for cell in row])
+
+    headers = cleaned_table[0]
+    num_cols = len(headers)
+    if num_cols == 0:
+        return ""
+
+    lines = [
+        "| " + " | ".join(headers) + " |",
+        "| " + " | ".join(["---"] * num_cols) + " |",
+    ]
+    for row in cleaned_table[1:]:
+        padded = (row + [""] * num_cols)[:num_cols]
+        lines.append("| " + " | ".join(padded) + " |")
+    return "\n".join(lines)
+
+
 def _extract_pdf_with_pdfplumber(data: bytes) -> Tuple[str, int, str]:
     try:
         import pdfplumber  # type: ignore
@@ -75,9 +98,20 @@ def _extract_pdf_with_pdfplumber(data: bytes) -> Tuple[str, int, str]:
             with pdfplumber.open(path) as pdf:
                 pages = len(pdf.pages)
                 for idx, page in enumerate(pdf.pages, 1):
+                    page_parts = []
+                    try:
+                        tables = page.extract_tables() or []
+                        for tbl in tables:
+                            md_tbl = _format_table_to_markdown(tbl)
+                            if md_tbl:
+                                page_parts.append(md_tbl)
+                    except Exception:
+                        pass
                     text = page.extract_text(x_tolerance=1, y_tolerance=3) or ""
                     if text.strip():
-                        texts.append(f"--- page {idx} ---\n{text}")
+                        page_parts.append(text)
+                    if page_parts:
+                        texts.append(f"--- page {idx} ---\n" + "\n\n".join(page_parts))
             return "\n\n".join(texts), pages, "pdfplumber"
         finally:
             _safe_unlink(path)

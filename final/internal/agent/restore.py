@@ -37,7 +37,10 @@ def restore_from_db(agent):
     if chat_repo is not None:
         chat_limit = agent.cfg.short_term_max_turns * 2  # 每轮 = user + assistant
         try:
-            history = chat_repo.load(chat_limit)
+            try:
+                history = chat_repo.load(chat_limit, user_id=getattr(agent, "user_id", "default_user"))
+            except TypeError:
+                history = chat_repo.load(chat_limit)
         except Exception as e:
             logger.warning("⚠️  chat_history.load 失败: %s", e)
             history = []
@@ -99,7 +102,12 @@ def init_knowledge_graph(agent):
         )
 
     try:
-        kg = KGStore(agent.cfg, client, llm_fn=_llm_fn)
+        kg = KGStore(
+            agent.cfg,
+            client,
+            llm_fn=_llm_fn,
+            user_id=agent.user_id,
+        )
     except Exception as e:
         logger.info("ℹ️  KGStore 构造失败 (%s)，记忆/RAG 退化为非图模式", e)
         return
@@ -125,7 +133,12 @@ def init_knowledge_graph(agent):
     ltm = getattr(agent, "ltm", None)
     try:
         graph_memory = GraphMemory(
-            agent.cfg, client, llm=_llm_fn, sim_threshold=sim, ltm=ltm
+            agent.cfg,
+            client,
+            llm=_llm_fn,
+            sim_threshold=sim,
+            ltm=ltm,
+            user_id=agent.user_id,
         )
     except Exception as e:
         logger.warning("⚠️  GraphMemory 构造失败: %s", e)

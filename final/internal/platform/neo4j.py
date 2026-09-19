@@ -16,11 +16,21 @@ except ImportError:
     _HAS_NEO4J = False
 
 
-# 启动期幂等创建的约束/索引（与 Go 版一致）
+# 启动期幂等创建的租户约束/索引。
+#
+# 先创建复合唯一约束，确认成功后才移除旧的全局 ``entity_name`` 约束。
+# 这不会改写或删除节点；没有 user_id 的旧节点会被业务查询 fail-closed 地忽略，
+# 需要从主存储重建图投影。
+_ENTITY_TENANT_CONSTRAINT = (
+    "CREATE CONSTRAINT entity_user_name IF NOT EXISTS "
+    "FOR (e:Entity) REQUIRE (e.user_id, e.name) IS UNIQUE"
+)
+_DROP_LEGACY_ENTITY_CONSTRAINT = "DROP CONSTRAINT entity_name IF EXISTS"
 _CONSTRAINTS: List[str] = [
-    "CREATE CONSTRAINT entity_name IF NOT EXISTS FOR (e:Entity) REQUIRE e.name IS UNIQUE",
+    _ENTITY_TENANT_CONSTRAINT,
     "CREATE INDEX entity_type IF NOT EXISTS FOR (e:Entity) ON (e.type)",
-    "CREATE INDEX memory_node_id IF NOT EXISTS FOR (m:Memory) ON (m.mem_id)",
+    "CREATE CONSTRAINT memory_user_id IF NOT EXISTS "
+    "FOR (m:Memory) REQUIRE (m.user_id, m.mem_id) IS UNIQUE",
 ]
 
 
@@ -85,14 +95,41 @@ class Neo4jClient:
 
     # ─── 约束 / 索引 ───
     def ensure_constraints(self) -> None:
-        """启动期幂等执行约束 / 索引创建（已存在或版本不支持时忽略）。"""
+        """启动期幂等执行租户约束 / 索引迁移。
+
+        只有复合实体约束创建成功后才删除旧的全局 name 约束，避免在目标
+        Neo4j 版本不支持复合约束时主动放宽唯一性。此过程不迁移旧节点；
+        旧节点没有 user_id，后续所有业务 Cypher 都会忽略它们。
+        """
         if self._driver is None:
             return
         try:
             with self._driver.session(default_access_mode="WRITE") as sess:
-                for q in _CONSTRAINTS:
+                entity_constraint_ready = False
+                try:
+                    result = sess.run(_ENTITY_TENANT_CONSTRAINT)
+                    consume = getattr(result, "consume", None)
+                    if callable(consume):
+                        consume()
+                    entity_constraint_ready = True
+                except Exception as e:
+                    logger.warning("⚠️  Neo4j 租户复合约束创建失败，保留旧约束: %s", e)
+
+                if entity_constraint_ready:
                     try:
-                        sess.run(q)
+                        result = sess.run(_DROP_LEGACY_ENTITY_CONSTRAINT)
+                        consume = getattr(result, "consume", None)
+                        if callable(consume):
+                            consume()
+                    except Exception as e:
+                        logger.info("ℹ️  Neo4j constraint/index: %s", e)
+
+                for q in _CONSTRAINTS[1:]:
+                    try:
+                        result = sess.run(q)
+                        consume = getattr(result, "consume", None)
+                        if callable(consume):
+                            consume()
                     except Exception as e:
                         logger.info("ℹ️  Neo4j constraint/index: %s", e)
         except Exception as e:

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from internal.resilience.budget import inherit_context
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional
 
@@ -97,7 +98,7 @@ class ContextAssembler:
         if slots:
             with ThreadPoolExecutor(max_workers=max(1, len(slots))) as pool:
                 futures = {
-                    pool.submit(self._fill_slot, slot, q): idx
+                    pool.submit(inherit_context(self._fill_slot), slot, q): idx
                     for idx, slot in enumerate(slots)
                 }
                 for fut in futures:

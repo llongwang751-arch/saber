@@ -72,14 +72,14 @@ class ESClient:
     def search(self, index: str, body: Dict[str, Any]) -> Dict[str, Any]:
         """通用检索，返回原始响应（dict）；失败返回 {}。"""
         if self._es is None:
-            return {}
+            raise RuntimeError("elasticsearch not connected")
         try:
             resp = self._es.search(index=index, body=body)
             # elasticsearch-py 8.x 返回 ObjectApiResponse；用 dict() 兼容
             return dict(resp)
         except Exception as e:
             logger.warning("⚠️  ES 检索失败: %s", e)
-            return {}
+            raise
 
     def search_raw(self, index: str, query_json: str) -> str:
         """以 JSON 字符串入参与返回，便于跨语言桥接。"""

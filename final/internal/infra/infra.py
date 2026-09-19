@@ -10,7 +10,16 @@ from types import SimpleNamespace
 from typing import Any, Iterable, List, Optional, Sequence, Tuple
 
 from config.config import APIConfig
-from internal.repo import chathistory, documentrepo, eventbus, longterm, preference, ragchunk, snapshot
+from internal.repo import (
+    chathistory,
+    documentrepo,
+    eventbus,
+    longterm,
+    memory_projection,
+    preference,
+    ragchunk,
+    snapshot,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +58,7 @@ _RAG_METRIC_TYPE = "L2"
 _RAG_INDEX_NLIST = 128
 # content 字段最大长度（与 Go 端 max_length=4096 对齐）
 _RAG_CONTENT_MAX_LEN = 4096
+_RAG_USER_ID_MAX_LEN = 256
 
 
 @dataclass
@@ -206,17 +216,42 @@ class _MilvusAdapter:
             logger.warning("⚠️  Milvus 插入失败: %s", e)
             return False
 
+    def upsert(self, collection_name: str, data: List[dict]) -> bool:
+        """幂等写入；兼容没有原生 upsert 的旧版 Milvus client。"""
+        if self._client is None or not data:
+            return False
+        try:
+            upsert = getattr(self._client, "upsert", None)
+            if callable(upsert):
+                upsert(collection_name=collection_name, data=data)
+                return True
+            ids = [int(item["pg_id"]) for item in data if item.get("pg_id") is not None]
+            if ids:
+                self._client.delete(
+                    collection_name=collection_name,
+                    filter=f"pg_id in [{', '.join(str(item) for item in ids)}]",
+                )
+            self._client.insert(collection_name=collection_name, data=data)
+            return True
+        except Exception as e:
+            logger.warning("⚠️  Milvus Upsert 失败: %s", e)
+            return False
+
     def search(self, collection_name: str, query_emb: List[float], top_k: int,
-               output_fields: Optional[List[str]] = None) -> List[dict]:
+               output_fields: Optional[List[str]] = None,
+               filter_expr: Optional[str] = None) -> List[dict]:
         if self._client is None:
             return []
         try:
-            results = self._client.search(
-                collection_name=collection_name,
-                data=[query_emb],
-                limit=top_k,
-                output_fields=output_fields or ["pg_id", "content"],
-            )
+            search_kwargs = {
+                "collection_name": collection_name,
+                "data": [query_emb],
+                "limit": top_k,
+                "output_fields": output_fields or ["pg_id", "content"],
+            }
+            if filter_expr:
+                search_kwargs["filter"] = filter_expr
+            results = self._client.search(**search_kwargs)
             hits: List[dict] = []
             if not results:
                 return hits
@@ -280,11 +315,14 @@ class Infrastructure:
         self._es = None
         self._kafka_producer = None
         self._milvus = None
+        self._neo4j_memory = None
+        self.memory_projection = None
 
         self._connect_postgres()
         self._connect_es()
         self._connect_kafka()
         self._connect_milvus()
+        self._connect_memory_neo4j()
 
         # ─── repo 装配（统一持久化入口） ────────────────────────────────
         # 业务侧应通过 inf.repo.<domain>.<method>(...) 访问；此处不重复 connect，
@@ -303,6 +341,7 @@ class Infrastructure:
             documents=documentrepo.Store(pg_client),
             events=eventbus.KafkaPublisher(kafka_client),
         )
+        self._start_memory_projection()
 
     # ─────────────────────────────── PostgreSQL ───────────────────────────────
 
@@ -338,17 +377,20 @@ class Infrastructure:
             )""",
             """CREATE TABLE IF NOT EXISTS task_snapshots (
                 task_id    TEXT PRIMARY KEY,
+                user_id    TEXT NOT NULL DEFAULT 'legacy',
                 state      JSONB NOT NULL,
                 created_at TIMESTAMP DEFAULT NOW()
             )""",
             """CREATE TABLE IF NOT EXISTS chat_history (
                 id         SERIAL PRIMARY KEY,
+                user_id    TEXT NOT NULL DEFAULT 'legacy',
                 role       TEXT NOT NULL,
                 content    TEXT NOT NULL,
                 created_at TIMESTAMP DEFAULT NOW()
             )""",
             """CREATE TABLE IF NOT EXISTS long_term_memory (
                 id            SERIAL PRIMARY KEY,
+                user_id       TEXT NOT NULL DEFAULT 'legacy',
                 content       TEXT NOT NULL,
                 importance    FLOAT NOT NULL DEFAULT 0.5,
                 embedding     JSONB,
@@ -366,21 +408,62 @@ class Infrastructure:
             "ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS tags          JSONB NOT NULL DEFAULT '[]'::jsonb",
             "ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS slot_hint     VARCHAR(64) NOT NULL DEFAULT ''",
             "ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS score         DOUBLE PRECISION NOT NULL DEFAULT 0.0",
+            "ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS user_id       TEXT NOT NULL DEFAULT 'legacy'",
+            "ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS status        VARCHAR(32) NOT NULL DEFAULT 'active'",
+            "ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS superseded_by BIGINT",
+            "ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS quarantine_reason TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 1",
+            "ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+            "ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ",
+            "ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS content_hash TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS embedding_model TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS embedding_revision TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS superseded_at TIMESTAMPTZ",
+            "ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS supersedes JSONB NOT NULL DEFAULT '[]'::jsonb",
+            "CREATE INDEX IF NOT EXISTS idx_ltm_active_user_id ON long_term_memory(user_id, id) WHERE deleted_at IS NULL",
+            """CREATE TABLE IF NOT EXISTS memory_outbox (
+                id BIGSERIAL PRIMARY KEY, event_id UUID NOT NULL UNIQUE,
+                aggregate_id BIGINT NOT NULL, user_id TEXT NOT NULL,
+                aggregate_version BIGINT NOT NULL, event_type TEXT NOT NULL,
+                target TEXT NOT NULL, payload JSONB NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending', attempts INT NOT NULL DEFAULT 0,
+                available_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), locked_at TIMESTAMPTZ,
+                locked_by TEXT, processed_at TIMESTAMPTZ, last_error TEXT,
+                repair_dedupe_key TEXT UNIQUE, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_memory_outbox_ready ON memory_outbox(target, available_at, id) WHERE status = 'pending'",
+            "CREATE INDEX IF NOT EXISTS idx_memory_outbox_stale_lock ON memory_outbox(target, locked_at) WHERE status = 'processing'",
+            "CREATE INDEX IF NOT EXISTS idx_memory_outbox_aggregate ON memory_outbox(aggregate_id, aggregate_version)",
+            "ALTER TABLE chat_history ADD COLUMN IF NOT EXISTS user_id TEXT NOT NULL DEFAULT 'legacy'",
+            "ALTER TABLE chat_history ADD COLUMN IF NOT EXISTS conversation_id TEXT NOT NULL DEFAULT ''",
+            "CREATE INDEX IF NOT EXISTS ix_chat_history_conversation ON chat_history(user_id, conversation_id, id)",
+            "ALTER TABLE task_snapshots ADD COLUMN IF NOT EXISTS user_id TEXT NOT NULL DEFAULT 'legacy'",
             "CREATE INDEX IF NOT EXISTS idx_lti_category ON long_term_memory(category)",
             "CREATE INDEX IF NOT EXISTS idx_lti_tags     ON long_term_memory USING GIN(tags)",
+            "CREATE INDEX IF NOT EXISTS idx_lti_user_status ON long_term_memory(user_id, status, id)",
+            "CREATE INDEX IF NOT EXISTS idx_chat_user ON chat_history(user_id, id DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_snapshots_user ON task_snapshots(user_id, created_at DESC)",
             """CREATE TABLE IF NOT EXISTS rag_chunks (
                 id          BIGSERIAL PRIMARY KEY,
+                user_id     TEXT NOT NULL DEFAULT 'default_user',
                 doc_hash    TEXT NOT NULL,
                 chunk_idx   INT NOT NULL,
                 content     TEXT NOT NULL,
                 parent_content TEXT,
                 embedding   JSONB,
-                created_at  TIMESTAMP DEFAULT NOW(),
-                UNIQUE (doc_hash, chunk_idx)
+                created_at  TIMESTAMP DEFAULT NOW()
             )""",
             """ALTER TABLE rag_chunks ADD COLUMN IF NOT EXISTS parent_content TEXT""",
-            """CREATE UNIQUE INDEX IF NOT EXISTS rag_chunks_doc_hash_chunk_idx_key
-                   ON rag_chunks (doc_hash, chunk_idx)""",
+            "ALTER TABLE rag_chunks ADD COLUMN IF NOT EXISTS document_id TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE rag_chunks ADD COLUMN IF NOT EXISTS version_id TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE rag_chunks ADD COLUMN IF NOT EXISTS section TEXT NOT NULL DEFAULT ''",
+            """ALTER TABLE rag_chunks ADD COLUMN IF NOT EXISTS user_id
+                   TEXT NOT NULL DEFAULT 'default_user'""",
+            "ALTER TABLE rag_chunks DROP CONSTRAINT IF EXISTS rag_chunks_doc_hash_chunk_idx_key",
+            "DROP INDEX IF EXISTS rag_chunks_doc_hash_chunk_idx_key",
+            """CREATE UNIQUE INDEX IF NOT EXISTS rag_chunks_user_doc_hash_chunk_idx_key
+                   ON rag_chunks (user_id, doc_hash, chunk_idx)""",
+            "CREATE INDEX IF NOT EXISTS idx_rag_chunks_user_id ON rag_chunks(user_id, id)",
             """CREATE TABLE IF NOT EXISTS documents (
                 id          TEXT PRIMARY KEY,
                 title       TEXT NOT NULL,
@@ -478,6 +561,99 @@ class Infrastructure:
             self._milvus = None
             self.ready.milvus = "memory-mode"
 
+    def _connect_memory_neo4j(self) -> None:
+        """Create the strict Neo4j handle used by the durable memory worker."""
+
+        if not bool(getattr(self.cfg, "kg_enabled", False)):
+            return
+        try:
+            from internal.platform.neo4j import Neo4jClient
+
+            client = Neo4jClient(self.cfg)
+            if client.is_real():
+                self._neo4j_memory = client
+            else:
+                client.close()
+        except Exception as exc:
+            logger.warning("⚠️  Neo4j 记忆投影不可用: %s", exc)
+            self._neo4j_memory = None
+
+    def _start_memory_projection(self) -> None:
+        """Wire PostgreSQL outbox workers and periodic target reconciliation."""
+
+        if self._pg is None or not _HAS_PG:
+            return
+        repository = memory_projection.PostgresMemoryOutboxRepository(
+            lambda: psycopg2.connect(self.cfg.pg_dsn())
+        )
+        workers = []
+        reconcilers = []
+
+        if self._milvus is not None:
+            try:
+                store = memory_projection.MilvusMemoryProjectionStore(
+                    self._milvus, int(self.cfg.rag_milvus_dim or 1024)
+                )
+                store.initialize()
+                projector = memory_projection.MemoryTargetProjector(
+                    memory_projection.Target.MILVUS, store
+                )
+                workers.append(
+                    memory_projection.MemoryProjectionWorker(
+                        repository,
+                        projector,
+                        worker_id="python-milvus-memory",
+                    )
+                )
+                reconcilers.append(
+                    memory_projection.MemoryReconciler(
+                        repository, store, memory_projection.Target.MILVUS
+                    )
+                )
+            except Exception as exc:
+                logger.warning("⚠️  Milvus 记忆投影 worker 未启动: %s", exc)
+
+        if self._neo4j_memory is not None:
+            try:
+                store = memory_projection.Neo4jMemoryProjectionStore(self._neo4j_memory)
+                projector = memory_projection.MemoryTargetProjector(
+                    memory_projection.Target.NEO4J, store
+                )
+                workers.append(
+                    memory_projection.MemoryProjectionWorker(
+                        repository,
+                        projector,
+                        worker_id="python-neo4j-memory",
+                    )
+                )
+                reconcilers.append(
+                    memory_projection.MemoryReconciler(
+                        repository, store, memory_projection.Target.NEO4J
+                    )
+                )
+            except Exception as exc:
+                logger.warning("⚠️  Neo4j 记忆投影 worker 未启动: %s", exc)
+
+        supervisor = memory_projection.MemoryProjectionSupervisor(
+            repository,
+            workers,
+            reconcilers,
+            poll_seconds=float(getattr(self.cfg, "memory_projection_poll_seconds", 0.5) or 0.5),
+            reconcile_seconds=float(
+                getattr(self.cfg, "memory_reconcile_seconds", 6 * 60 * 60)
+                or 6 * 60 * 60
+            ),
+        )
+        self.repo.memory_outbox = repository
+        self.repo.memory_projection = supervisor
+        self.memory_projection = supervisor
+        supervisor.start()
+        logger.info(
+            "✅ 长期记忆投影已启动 workers=%d reconcile=%d",
+            len(workers),
+            len(reconcilers),
+        )
+
     def _init_milvus_collections(self):
         if not self._milvus:
             return
@@ -492,7 +668,7 @@ class Infrastructure:
             logger.warning("⚠️  Milvus 创建集合失败: %s", e)
 
     def _create_milvus_rag_collection(self, collection_name: str, dim: int):
-        """以显式 schema 创建 RAG 集合：pg_id (PK Int64) / content (VarChar 4096) / embedding。
+        """以显式 schema 创建 RAG 集合：pg_id / content / user_id / embedding。
 
         与 main 分支 Go 实现 EnsureMilvusCollection 对齐。
         """
@@ -504,6 +680,11 @@ class Infrastructure:
             field_name="content",
             datatype=DataType.VARCHAR,
             max_length=_RAG_CONTENT_MAX_LEN,
+        )
+        schema.add_field(
+            field_name="user_id",
+            datatype=DataType.VARCHAR,
+            max_length=_RAG_USER_ID_MAX_LEN,
         )
         schema.add_field(
             field_name="embedding", datatype=DataType.FLOAT_VECTOR, dim=dim
@@ -544,8 +725,11 @@ class Infrastructure:
 
         pk_name: Optional[str] = None
         embedding_dim: Optional[int] = None
+        field_names = set()
         for f in fields:
             name = f.get("name") if isinstance(f, dict) else getattr(f, "name", None)
+            if name:
+                field_names.add(name)
             is_primary = (
                 f.get("is_primary") if isinstance(f, dict) else getattr(f, "is_primary", False)
             )
@@ -574,10 +758,30 @@ class Infrastructure:
                 "请手动 drop 旧集合后重新 ingest 全量数据",
                 collection_name, expected_dim, embedding_dim,
             )
+        if "user_id" not in field_names:
+            logger.warning(
+                "⚠️  Milvus 集合 %s 缺少 user_id 租户字段；为防止跨租户检索，"
+                "请使用 PG 真相源重建该集合",
+                collection_name,
+            )
 
     # ─────────────────────────────── 生命周期 ────────────────────────────────
 
     def close(self):
+        if self.memory_projection is not None:
+            try:
+                self.memory_projection.close()
+            except Exception as e:
+                logger.warning("⚠️  记忆投影关闭失败: %s", e)
+            finally:
+                self.memory_projection = None
+        if self._neo4j_memory is not None:
+            try:
+                self._neo4j_memory.close()
+            except Exception as e:
+                logger.warning("⚠️  Neo4j 记忆投影连接关闭失败: %s", e)
+            finally:
+                self._neo4j_memory = None
         if self._pg:
             try:
                 self._pg.close()

@@ -26,6 +26,7 @@ _RAG_INDEX_NLIST = 128
 
 # content 字段最大长度（与 Go 端 TypeParams["max_length"]=4096 对齐）
 _RAG_CONTENT_MAX_LEN = 4096
+_RAG_USER_ID_MAX_LEN = 256
 
 
 class MilvusClientWrapper:
@@ -87,7 +88,7 @@ class MilvusClientWrapper:
             logger.warning("⚠️  Milvus 创建集合失败: %s", e)
 
     def _create_rag_collection(self, collection_name: str, dim: int) -> None:
-        """以显式 schema 创建 RAG 集合：pg_id/content/embedding。"""
+        """以显式 schema 创建带租户字段的 RAG 集合。"""
         if self._client is None or DataType is None:
             return
         # 显式 schema：与 Go 端 entity.Schema 对齐
@@ -99,6 +100,11 @@ class MilvusClientWrapper:
             field_name="content",
             datatype=DataType.VARCHAR,
             max_length=_RAG_CONTENT_MAX_LEN,
+        )
+        schema.add_field(
+            field_name="user_id",
+            datatype=DataType.VARCHAR,
+            max_length=_RAG_USER_ID_MAX_LEN,
         )
         schema.add_field(
             field_name="embedding", datatype=DataType.FLOAT_VECTOR, dim=dim
@@ -141,8 +147,11 @@ class MilvusClientWrapper:
 
         pk_name: Optional[str] = None
         embedding_dim: Optional[int] = None
+        field_names = set()
         for f in fields:
             name = f.get("name") if isinstance(f, dict) else getattr(f, "name", None)
+            if name:
+                field_names.add(name)
             is_primary = (
                 f.get("is_primary") if isinstance(f, dict) else getattr(f, "is_primary", False)
             )
@@ -170,6 +179,12 @@ class MilvusClientWrapper:
                 "⚠️  Milvus 集合 %s embedding 维度不一致 (expected=%d, actual=%d)，"
                 "请手动 drop 旧集合后重新 ingest 全量数据",
                 collection_name, expected_dim, embedding_dim,
+            )
+        if "user_id" not in field_names:
+            logger.warning(
+                "⚠️  Milvus 集合 %s 缺少 user_id 租户字段；为防止跨租户检索，"
+                "请使用 PG 真相源重建该集合",
+                collection_name,
             )
 
     def ensure_collection(self, collection_name: str, dimension: int,
@@ -213,17 +228,46 @@ class MilvusClientWrapper:
             logger.warning("⚠️  Milvus 插入失败: %s", e)
             return False
 
+    def upsert(self, collection_name: str, data: List[Dict[str, Any]]) -> bool:
+        """Idempotently insert or replace entities by primary key."""
+
+        if self._client is None or not data:
+            return False
+        try:
+            upsert = getattr(self._client, "upsert", None)
+            if callable(upsert):
+                upsert(collection_name=collection_name, data=data)
+                return True
+            # Compatibility for older clients: delete known primary keys first.
+            ids = [int(item["pg_id"]) for item in data if item.get("pg_id") is not None]
+            if ids:
+                self._client.delete(
+                    collection_name=collection_name,
+                    filter=f"pg_id in [{', '.join(str(item) for item in ids)}]",
+                )
+            self._client.insert(collection_name=collection_name, data=data)
+            return True
+        except Exception as e:
+            logger.warning("⚠️  Milvus Upsert 失败: %s", e)
+            return False
+
     def search(self, collection_name: str, query_emb: List[float], top_k: int,
-               output_fields: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+               output_fields: Optional[List[str]] = None,
+               filter_expr: Optional[str] = None) -> List[Dict[str, Any]]:
         """单 query 向量检索；返回 hit 列表（pg_id/content/score）。失败返回空列表。"""
         if self._client is None:
-            return []
+            raise RuntimeError("milvus not connected")
         try:
+            search_kwargs = {
+                "collection_name": collection_name,
+                "data": [query_emb],
+                "limit": top_k,
+                "output_fields": output_fields or ["pg_id", "content"],
+            }
+            if filter_expr:
+                search_kwargs["filter"] = filter_expr
             results = self._client.search(
-                collection_name=collection_name,
-                data=[query_emb],
-                limit=top_k,
-                output_fields=output_fields or ["pg_id", "content"],
+                **search_kwargs,
             )
             hits: List[Dict[str, Any]] = []
             if not results:
@@ -238,7 +282,7 @@ class MilvusClientWrapper:
             return hits
         except Exception as e:
             logger.warning("⚠️  Milvus 检索失败: %s", e)
-            return []
+            raise
 
     def delete(self, collection_name: str, filter_expr: str) -> bool:
         """按布尔表达式删除（如 'pg_id == 123'）。"""

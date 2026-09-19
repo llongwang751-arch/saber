@@ -32,6 +32,21 @@ class _Agent:
         self.tool_tracker.record(trace)
 
 
+def test_planned_nested_parameters_keep_types_through_checkpoint_and_execution():
+    import json
+    expected = {'settings': {'weight': 75, 'labels': ['a', 'b']}, 'save_document': False}
+    agent = _Agent()
+    agent.cfg.is_real_llm = lambda: True
+    agent.llm = SimpleNamespace(chat=lambda *a, **k: json.dumps([{'id': 'typed', 'tool': 'typed_tool', 'params': expected}]))
+    received = []
+    tools = {'typed_tool': _Tool(lambda p: received.append(p) or 'ok')}
+    nodes = llm_plan_graph(agent, '调用 typed_tool', tools, '')
+    assert nodes[0].params == expected
+    result = GraphRuntime(TaskGraph(nodes), agent, GraphConfig(), tools, {'task_id': 'typed'}).execute(CancelToken())
+    assert not result.interrupted and received == [expected]
+    assert agent.snapshots[-1]['recovery']['nodes'][0]['params'] == expected
+
+
 def test_graph_runtime_executes_dependency_levels_and_records_context():
     calls = []
     tools = {
@@ -144,7 +159,7 @@ def test_graph_runtime_marks_pending_cancelled_when_cancelled_before_start():
     assert graph.nodes["n1"].status == NodeStatus.CANCELLED
 
 
-def test_rule_plan_nodes_outputs_graph_nodes_with_race_groups():
+def test_rule_plan_nodes_only_marks_builtin_search_as_race_group():
     tools = {
         "search_web": _Tool(lambda _params: "web"),
         "rag_search": _Tool(lambda _params: "rag"),
@@ -155,7 +170,8 @@ def test_rule_plan_nodes_outputs_graph_nodes_with_race_groups():
 
     assert [node.id for node in nodes] == ["n1", "n2"]
     assert {node.tool_name for node in nodes} == {"search_web", "rag_search"}
-    assert all(node.race_group == "search" for node in nodes)
+    assert nodes[0].race_group == "search"
+    assert nodes[1].race_group == ""
 
 
 def test_llm_plan_graph_parses_dependencies_and_race_group():

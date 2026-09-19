@@ -42,6 +42,43 @@ def test_validate_rejects_cycle():
         graph.topological_levels()
 
 
+def test_required_dependency_failure_skips_downstream():
+    graph = TaskGraph([
+        Node(id="n1", tool_name="required", status=NodeStatus.FAILED),
+        Node(id="n2", tool_name="downstream", depends_on=["n1"]),
+        Node(id="n3", tool_name="after", depends_on=["n2"]),
+    ])
+
+    assert graph.ready_nodes() == []
+    assert graph.nodes["n2"].status == NodeStatus.SKIPPED
+    assert graph.nodes["n3"].status == NodeStatus.SKIPPED
+    assert "n1" in graph.nodes["n2"].error
+
+
+def test_optional_dependency_failure_allows_transparent_degradation():
+    graph = TaskGraph([
+        Node(id="n1", tool_name="optional", status=NodeStatus.FAILED),
+        Node(
+            id="n2",
+            tool_name="downstream",
+            depends_on=["n1"],
+            optional_depends_on=["n1"],
+        ),
+    ])
+
+    assert graph.ready_nodes() == ["n2"]
+
+
+def test_validate_rejects_optional_dependency_not_in_dependency_list():
+    graph = TaskGraph([
+        Node(id="n1", tool_name="a"),
+        Node(id="n2", tool_name="b", optional_depends_on=["n1"]),
+    ])
+
+    with pytest.raises(ValueError, match="optional dependencies"):
+        graph.validate()
+
+
 def test_race_groups_and_node_mutations():
     graph = TaskGraph([
         Node(id="n1", type=NodeType.TOOL, tool_name="search_web", race_group="search"),

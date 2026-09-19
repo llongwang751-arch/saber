@@ -16,6 +16,7 @@ class Query:
     embedding: List[float] = field(default_factory=list)  # 已计算的 query embedding（可为空）
     task_id: str = ""                               # 当前任务 ID（用于 Task Memory）
     mode: str = ""                                  # chat / tool / react / rag
+    user_id: str = ""                               # 多租户隔离主键
 
 
 class ContextSource(ABC):

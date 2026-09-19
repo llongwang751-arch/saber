@@ -29,6 +29,7 @@ class _Infra:
         self.repo = SimpleNamespace(
             preference=_PrefRepo(),
             ltm=_LtmRepo(),
+            snapshot=SimpleNamespace(save=lambda *args, **kwargs: None),
         )
 
 
@@ -53,6 +54,7 @@ class _LLM:
 def _agent_shell():
     agent = object.__new__(UnifiedAgent)
     agent.cfg = _Cfg()
+    agent.user_id = 'u'
     agent.inf = _Infra()
     agent.llm = _LLM()
     agent.stm = ShortTerm(5)
@@ -109,3 +111,38 @@ def test_agent_react_uses_graph_runtime_path():
     assert task["graph"]["nodes"]
     assert "web" in answer or "rag" in answer
     assert steps
+
+
+def test_invalid_plan_never_drops_dependencies_to_execute(monkeypatch):
+    from internal.graph.task_graph import Node
+    agent = _agent_shell()
+    calls = []
+    agent.tool_executor = ToolExecutor([Tool(name='write', description='', params=[], func=lambda _: calls.append(1))])
+    monkeypatch.setattr('internal.agent.agent.llm_plan_graph', lambda *a: [Node('one', tool_name='write', depends_on=['missing'])])
+    _, _, task = agent._run_react_with_tools('invalid plan', agent.tool_executor.snapshot(), '', [], None)
+    assert task['status'] == 'interrupted' and calls == []
+
+
+def test_main_lease_covers_final_generation_and_artifacts(tmp_path, monkeypatch):
+    import pytest
+    from internal.application.store import ApplicationStore
+    from internal.application.local_repos import LocalSnapshotRepo
+    from internal.harness.journal import ActionJournal
+    from internal.agent.recovery import TaskLease, RecoveryConflict
+    store = ApplicationStore('sqlite:///' + str(tmp_path / 'lease.db'))
+    agent = _agent_shell()
+    agent.user_id = store.create_user('u', 'hash')['id']
+    agent.inf.repo.snapshot = LocalSnapshotRepo(store)
+    agent.inf.repo.action_journal = ActionJournal(store)
+    agent._build_prompt_context()
+    observed = []
+    def artifact(*args, **kwargs):
+        task = agent._cancel_registry.current_task()
+        with pytest.raises(RecoveryConflict):
+            TaskLease(agent.inf.repo.action_journal, agent.user_id, task['task_id']).acquire()
+        observed.append(True)
+    monkeypatch.setattr('internal.agent.agent.produce_artifact', artifact)
+    _, _, task = agent._run_react_with_tools('搜索 RAG 是什么', agent.tool_executor.snapshot(), '', [], None)
+    assert task['status'] == 'completed' and observed == [True]
+    assert agent.inf.repo.action_journal.get(agent.user_id, 'task-lease:' + task['task_id'])['status'] == 'idle'
+    store.close()

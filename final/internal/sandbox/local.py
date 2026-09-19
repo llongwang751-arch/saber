@@ -32,10 +32,18 @@ class LocalSandbox:
     出于安全考虑，始终对命令做二次 block 校验，且超时强制终止。
     """
 
-    def __init__(self, cfg: SandboxConfig):
+    def __init__(self, cfg: SandboxConfig, sec_cfg: SecurityConfig | None = None):
         self.cfg = cfg
-        # 本地模式：强制非白名单模式，但 block 规则仍然生效
-        self._validator = Validator(SecurityConfig(max_command_length=cfg.max_output_bytes))
+        # 本地模式：强制非白名单模式，但 block 规则仍然生效；
+        # 命令长度上限复用部署方的 SecurityConfig，而不是输出截断阈值。
+        sec = sec_cfg or SecurityConfig()
+        self._validator = Validator(
+            SecurityConfig(
+                max_command_length=sec.max_command_length,
+                allowlist_mode=False,
+                allowlist=[],
+            )
+        )
 
     def backend(self) -> str:
         return "local"

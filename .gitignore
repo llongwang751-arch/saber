@@ -1,3 +1,15 @@
 # local staging area for spinning out video-factory into its own repo
 _vf-staging/
 final/config/config.local.yaml
+final/.runtime/
+final/runtime/
+final/.data/
+final/.venv/
+final/.venv313/
+final/.venv-*/
+final/__pycache__/
+final/**/__pycache__/
+
+# 本机临时验证/学习用目录（非项目源码）
+scratch/
+.pytest_cache/

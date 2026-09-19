@@ -37,7 +37,7 @@ class Sandbox:
                 logger.warning("⚠️  Docker 不可用，沙箱降级到 mock 模式")
                 self._executor = MockSandbox()
         elif backend == "local":
-            self._executor = LocalSandbox(sandbox_cfg)
+            self._executor = LocalSandbox(sandbox_cfg, sec_cfg)
         elif backend == "mock":
             self._executor = MockSandbox()
         else:
