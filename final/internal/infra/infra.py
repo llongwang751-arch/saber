@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from typing import Any, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 from config.config import APIConfig
+from internal.resilience.circuit_breaker import CircuitBreaker
 from internal.repo import (
     chathistory,
     documentrepo,
@@ -23,6 +24,21 @@ from internal.repo import (
 )
 
 logger = logging.getLogger(__name__)
+
+def _guarded(breaker: CircuitBreaker, degraded, call, *, label: str):
+    """熔断门禁内的远程调用：打开时快速返回降级结果，异常计入熔断。"""
+    if not breaker.allow_request():
+        logger.warning("⚠️  熔断打开，%s 调用直接降级", label)
+        return degraded
+    try:
+        result = call()
+    except Exception as e:
+        breaker.record_failure()
+        logger.warning("⚠️  %s 调用失败: %s", label, e)
+        return degraded
+    breaker.record_success()
+    return result
+
 
 # 尝试导入可选依赖，失败则标记不可用
 try:
@@ -90,11 +106,27 @@ class _PGAdapter:
 
     单条语句走 bootstrap 连接（autocommit）；多语句事务必须走 ``transaction()``，
     从独立连接池 checkout 专用连接，避免并发线程在同一连接上互踩事务。
+
+    断线韧性：
+    - 连接类错误（OperationalError/InterfaceError）视为基础设施故障：
+      bootstrap 连接重连一次；池内连接 checkout 时 ping 预检，死连接丢弃换新。
+    - 连续失败达到阈值后熔断打开：读路径快速返回空结果，事务路径快速抛错，
+      避免数据库宕机期间每个请求都付完整连接超时。SQL 错误不影响熔断计数。
     """
 
-    def __init__(self, conn, pool=None):
+    def __init__(self, conn, pool=None, connect_fn=None):
         self._conn = conn
         self._pool = pool
+        self._connect_fn = connect_fn
+        self._dead_conn_errors: Tuple[Any, ...] = tuple(
+            exc for exc in (
+                getattr(psycopg2, "OperationalError", None) if _HAS_PG else None,
+                getattr(psycopg2, "InterfaceError", None) if _HAS_PG else None,
+            ) if exc is not None
+        )
+        self._breaker = CircuitBreaker(
+            failure_threshold=3, cooldown_seconds=30.0, half_open_max_calls=1,
+        )
 
     def is_real(self) -> bool:
         return self._conn is not None or self._pool is not None
@@ -103,89 +135,180 @@ class _PGAdapter:
     def conn(self):
         return self._conn
 
+    def _is_dead_conn_error(self, exc: Exception) -> bool:
+        return isinstance(exc, self._dead_conn_errors)
+
+    def _reconnect(self) -> Any:
+        """重建 bootstrap 连接并 ping 验证；失败向上抛连接错误。"""
+        if self._connect_fn is None:
+            raise RuntimeError("postgres reconnect not configured")
+        try:
+            if self._conn is not None:
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        fresh = self._connect_fn()
+        fresh.autocommit = True
+        with fresh.cursor() as cur:
+            cur.execute("SELECT 1")
+        self._conn = fresh
+        logger.info("✅ PostgreSQL 连接已恢复")
+        return self._conn
+
+    def _execute_read(self, sql: str, params, fetch: str):
+        """单语句执行路径：熔断快速失败 → 断线重连一次重试。"""
+        if not self._breaker.allow_request():
+            logger.warning("⚠️  PG 熔断打开，语句执行直接降级: %.120s", sql)
+            return [] if fetch == "all" else None
+        attempt = 0
+        while True:
+            attempt += 1
+            conn = self._conn
+            if conn is None:
+                return [] if fetch == "all" else None
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(sql, params or ())
+                    if fetch == "all":
+                        result = list(cur.fetchall())
+                    elif fetch == "one":
+                        result = cur.fetchone()
+                    else:
+                        result = cur.rowcount
+                self._breaker.record_success()
+                return result
+            except Exception as exc:
+                if self._is_dead_conn_error(exc):
+                    self._breaker.record_failure()
+                    if attempt == 1:
+                        try:
+                            self._reconnect()
+                            continue
+                        except Exception:
+                            return [] if fetch == "all" else None
+                else:
+                    # SQL 层错误说明数据库本身可达，不计入熔断。
+                    self._breaker.record_success()
+                logger.warning("⚠️  PG 语句执行失败: %s", exc)
+                return [] if fetch == "all" else None
+
+    def query(self, sql: str, params: Optional[Sequence[Any]] = None) -> List[Tuple[Any, ...]]:
+        result = self._execute_read(sql, params, "all")
+        return result if isinstance(result, list) else []
+
+    def query_one(self, sql: str, params: Optional[Sequence[Any]] = None) -> Optional[Tuple[Any, ...]]:
+        return self._execute_read(sql, params, "one")
+
+    def exec(self, sql: str, params: Optional[Sequence[Any]] = None) -> int:
+        result = self._execute_read(sql, params, "rowcount")
+        return -1 if result is None else int(result)
+
+    def exec_many(self, sql: str, seq_of_params: Iterable[Sequence[Any]]) -> int:
+        if not self._breaker.allow_request():
+            logger.warning("⚠️  PG 熔断打开，批量执行直接降级")
+            return -1
+        conn = self._conn
+        if conn is None:
+            return -1
+        try:
+            with conn.cursor() as cur:
+                cur.executemany(sql, list(seq_of_params))
+                rowcount = cur.rowcount
+            self._breaker.record_success()
+            return rowcount
+        except Exception as e:
+            if self._is_dead_conn_error(e):
+                self._breaker.record_failure()
+            logger.warning("⚠️  PG exec_many 失败: %s", e)
+            return -1
+
     @contextmanager
     def transaction(self) -> Iterator[Any]:
-        """专用连接上的一个事务：with 块正常退出提交，异常回滚。"""
-        if self._pool is not None:
-            conn = self._pool.getconn()
-            try:
-                conn.autocommit = False
+        """专用连接上的一个事务：with 块正常退出提交，异常回滚。
+
+        checkout 后先 ping 预检，死连接丢弃换新重试一次；进入事务体后不再重试
+        （contextmanager 语义不允许对已中断的 with 体重新 yield）。
+        事务路径绝不静默降级为成功：拿不到健康连接或熔断打开时直接抛错。
+        """
+        if self._pool is None:
+            with self._bootstrap_transaction() as conn:
                 yield conn
-                conn.commit()
-            except Exception:
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
-                raise
-            finally:
-                try:
-                    self._pool.putconn(conn)
-                except Exception:
-                    pass
             return
 
-        # 无池时的兜底：退回共享连接上的事务（保留旧行为，生产路径始终有池）。
+        if not self._breaker.allow_request():
+            raise RuntimeError("postgres circuit open")
+        conn = None
+        attempt = 0
+        while True:
+            attempt += 1
+            candidate = self._pool.getconn()
+            try:
+                candidate.autocommit = True
+                with candidate.cursor() as cur:
+                    cur.execute("SELECT 1")
+                conn = candidate
+                break
+            except Exception as exc:
+                try:
+                    self._pool.putconn(candidate, close=True)
+                except Exception:
+                    pass
+                if attempt < 2:
+                    logger.warning("⚠️  PG 池内死连接已丢弃，重试 checkout: %s", exc)
+                    continue
+                raise RuntimeError(f"postgres unavailable: {exc}")
+
+        try:
+            conn.autocommit = False
+            yield conn
+            conn.commit()
+            self._breaker.record_success()
+            self._pool.putconn(conn)
+        except Exception as exc:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            dead = self._is_dead_conn_error(exc)
+            try:
+                self._pool.putconn(conn, close=dead)
+            except Exception:
+                pass
+            if dead:
+                self._breaker.record_failure()
+            else:
+                # SQL 层错误说明连接本身可用，不计入熔断。
+                self._breaker.record_success()
+            raise
+
+    @contextmanager
+    def _bootstrap_transaction(self) -> Iterator[Any]:
         conn = self._conn
         if conn is None:
             raise RuntimeError("postgres unavailable")
+        if not self._breaker.allow_request():
+            raise RuntimeError("postgres circuit open")
         prior_autocommit = conn.autocommit
         try:
             conn.autocommit = False
             yield conn
             conn.commit()
-        except Exception:
+            self._breaker.record_success()
+        except Exception as exc:
             try:
                 conn.rollback()
             except Exception:
                 pass
+            if self._is_dead_conn_error(exc):
+                self._breaker.record_failure()
+            else:
+                self._breaker.record_success()
             raise
         finally:
             conn.autocommit = prior_autocommit
-
-    def query(self, sql: str, params: Optional[Sequence[Any]] = None) -> List[Tuple[Any, ...]]:
-        if self._conn is None:
-            return []
-        try:
-            with self._conn.cursor() as cur:
-                cur.execute(sql, params or ())
-                return list(cur.fetchall())
-        except Exception as e:
-            logger.warning("⚠️  PG query 失败: %s", e)
-            return []
-
-    def query_one(self, sql: str, params: Optional[Sequence[Any]] = None) -> Optional[Tuple[Any, ...]]:
-        if self._conn is None:
-            return None
-        try:
-            with self._conn.cursor() as cur:
-                cur.execute(sql, params or ())
-                return cur.fetchone()
-        except Exception as e:
-            logger.warning("⚠️  PG query_one 失败: %s", e)
-            return None
-
-    def exec(self, sql: str, params: Optional[Sequence[Any]] = None) -> int:
-        if self._conn is None:
-            return -1
-        try:
-            with self._conn.cursor() as cur:
-                cur.execute(sql, params or ())
-                return cur.rowcount
-        except Exception as e:
-            logger.warning("⚠️  PG exec 失败: %s", e)
-            return -1
-
-    def exec_many(self, sql: str, seq_of_params: Iterable[Sequence[Any]]) -> int:
-        if self._conn is None:
-            return -1
-        try:
-            with self._conn.cursor() as cur:
-                cur.executemany(sql, list(seq_of_params))
-                return cur.rowcount
-        except Exception as e:
-            logger.warning("⚠️  PG exec_many 失败: %s", e)
-            return -1
 
 
 class _ESAdapter:
@@ -193,6 +316,9 @@ class _ESAdapter:
 
     def __init__(self, es):
         self._es = es
+        self._breaker = CircuitBreaker(
+            failure_threshold=3, cooldown_seconds=30.0, half_open_max_calls=1,
+        )
 
     def is_real(self) -> bool:
         return self._es is not None
@@ -204,31 +330,26 @@ class _ESAdapter:
     def index(self, index: str, doc_id: Any, body: dict) -> bool:
         if self._es is None:
             return False
-        try:
+        def _call():
             self._es.index(index=index, id=doc_id, body=body)
             return True
-        except Exception as e:
-            logger.warning("⚠️  ES 索引失败: %s", e)
-            return False
+        return _guarded(self._breaker, False, _call, label="ES index")
 
     def search(self, index: str, body: dict) -> dict:
         if self._es is None:
             return {}
-        try:
-            resp = self._es.search(index=index, body=body)
-            return dict(resp)
-        except Exception as e:
-            logger.warning("⚠️  ES 检索失败: %s", e)
-            return {}
+        def _call():
+            return dict(self._es.search(index=index, body=body))
+        return _guarded(self._breaker, {}, _call, label="ES search")
 
     def delete_many(self, index: str, doc_ids: List[Any]) -> None:
         if self._es is None:
             return
         for doc_id in doc_ids:
-            try:
+            def _call(doc_id=doc_id):
                 self._es.delete(index=index, id=doc_id)
-            except Exception as e:
-                logger.warning("⚠️  ES 删除失败 (id=%s): %s", doc_id, e)
+                return None
+            _guarded(self._breaker, None, _call, label=f"ES delete {doc_id}")
 
 
 class _MilvusAdapter:
@@ -236,6 +357,9 @@ class _MilvusAdapter:
 
     def __init__(self, client):
         self._client = client
+        self._breaker = CircuitBreaker(
+            failure_threshold=3, cooldown_seconds=30.0, half_open_max_calls=1,
+        )
 
     def is_real(self) -> bool:
         return self._client is not None
@@ -249,26 +373,23 @@ class _MilvusAdapter:
         # rag_chunks 集合由 _init_milvus_collections 在启动期建好；这里仅做存在性确认。
         if self._client is None:
             return False
-        try:
+        def _call():
             return bool(self._client.has_collection(collection_name))
-        except Exception:
-            return False
+        return _guarded(self._breaker, False, _call, label="Milvus ensure_collection")
 
     def insert(self, collection_name: str, data: List[dict]) -> bool:
         if self._client is None or not data:
             return False
-        try:
+        def _call():
             self._client.insert(collection_name=collection_name, data=data)
             return True
-        except Exception as e:
-            logger.warning("⚠️  Milvus 插入失败: %s", e)
-            return False
+        return _guarded(self._breaker, False, _call, label="Milvus insert")
 
     def upsert(self, collection_name: str, data: List[dict]) -> bool:
         """幂等写入；兼容没有原生 upsert 的旧版 Milvus client。"""
         if self._client is None or not data:
             return False
-        try:
+        def _call():
             upsert = getattr(self._client, "upsert", None)
             if callable(upsert):
                 upsert(collection_name=collection_name, data=data)
@@ -281,26 +402,25 @@ class _MilvusAdapter:
                 )
             self._client.insert(collection_name=collection_name, data=data)
             return True
-        except Exception as e:
-            logger.warning("⚠️  Milvus Upsert 失败: %s", e)
-            return False
+        return _guarded(self._breaker, False, _call, label="Milvus upsert")
 
     def search(self, collection_name: str, query_emb: List[float], top_k: int,
                output_fields: Optional[List[str]] = None,
                filter_expr: Optional[str] = None) -> List[dict]:
         if self._client is None:
             return []
-        try:
-            search_kwargs = {
-                "collection_name": collection_name,
-                "data": [query_emb],
-                "limit": top_k,
-                "output_fields": output_fields or ["pg_id", "content"],
-            }
-            if filter_expr:
-                search_kwargs["filter"] = filter_expr
-            results = self._client.search(**search_kwargs)
+        search_kwargs = {
+            "collection_name": collection_name,
+            "data": [query_emb],
+            "limit": top_k,
+            "output_fields": output_fields or ["pg_id", "content"],
+        }
+        if filter_expr:
+            search_kwargs["filter"] = filter_expr
+
+        def _call():
             hits: List[dict] = []
+            results = self._client.search(**search_kwargs)
             if not results:
                 return hits
             for result in results[0]:
@@ -311,19 +431,15 @@ class _MilvusAdapter:
                     "score": result.get("distance", 0.0) if isinstance(result, dict) else 0.0,
                 })
             return hits
-        except Exception as e:
-            logger.warning("⚠️  Milvus 检索失败: %s", e)
-            return []
+        return _guarded(self._breaker, [], _call, label="Milvus search")
 
     def delete(self, collection_name: str, filter_expr: str) -> bool:
         if self._client is None:
             return False
-        try:
+        def _call():
             self._client.delete(collection_name=collection_name, filter=filter_expr)
             return True
-        except Exception as e:
-            logger.warning("⚠️  Milvus 删除失败: %s", e)
-            return False
+        return _guarded(self._breaker, False, _call, label="Milvus delete")
 
 
 class _KafkaAdapter:
@@ -376,7 +492,11 @@ class Infrastructure:
         # ─── repo 装配（统一持久化入口） ────────────────────────────────
         # 业务侧应通过 inf.repo.<domain>.<method>(...) 访问；此处不重复 connect，
         # 只把已有句柄包成符合 internal.platform 接口的 thin adapter 注入 repo。
-        pg_client = _PGAdapter(self._pg, pool=self._pg_pool)
+        pg_client = _PGAdapter(
+            self._pg,
+            pool=self._pg_pool,
+            connect_fn=(lambda: psycopg2.connect(self.cfg.pg_dsn())) if _HAS_PG else None,
+        )
         es_client = _ESAdapter(self._es)
         milvus_client = _MilvusAdapter(self._milvus)
         kafka_client = _KafkaAdapter(self._kafka_producer, self.cfg, self.ready)

@@ -48,8 +48,8 @@ class Client:
         try:
             return self._call_chat(system_prompt, messages)
         except Exception as e:
-            logger.error("LLM API 调用失败: %s，回退到 Mock", e)
-            return self._mock(messages)
+            logger.error("LLM API 调用失败: %s", e)
+            return self._mock(messages, provider_failure=True)
 
     def chat_fast(self, messages: List[Message], system_prompt: str = "") -> str:
         """Planner/Replanner/子 Agent 内部步骤使用快模型；未配置时回退主模型。"""
@@ -61,8 +61,8 @@ class Client:
                 model=getattr(self.cfg, "llm_fast_model", "") or self.cfg.llm_model,
             )
         except Exception as e:
-            logger.error("Fast LLM API 调用失败: %s，回退到 Mock", e)
-            return self._mock(messages)
+            logger.error("Fast LLM API 调用失败: %s", e)
+            return self._mock(messages, provider_failure=True)
 
     def chat_context(self, ctx, system_prompt: str, messages: List[Message]) -> str:
         """兼容主分支 Go 版 ChatContext。"""
@@ -117,7 +117,7 @@ class Client:
                 return self._call_chat(system_prompt, messages)
             except Exception as e2:
                 logger.error("同步回退仍失败: %s", e2)
-                return self._mock(messages)
+                return self._mock(messages, provider_failure=True)
 
     def _call_chat_stream(
         self,
@@ -420,8 +420,21 @@ class Client:
 
     # ── Mock ────────────────────────────────────────────────────────────────
 
-    def _mock(self, messages: List[Message]) -> str:
-        if os.getenv("AGI_LLM_ALLOW_MOCK", "1").strip().lower() in {"0", "false", "no"}:
+    @staticmethod
+    def _mock_allowed(provider_failure: bool) -> bool:
+        """Mock 回复的准入门禁。
+
+        - 未配置真实模型（开发/离线 profile）：默认允许，AGI_LLM_ALLOW_MOCK=0 显式禁止。
+        - 已配置真实模型但调用失败：必须显式设置 AGI_LLM_ALLOW_MOCK=1 才允许回退，
+          否则抛错——生产环境不能拿模拟回复冒充真实答案。
+        """
+        raw = os.getenv("AGI_LLM_ALLOW_MOCK", "").strip().lower()
+        if provider_failure:
+            return raw in {"1", "true", "yes", "on"}
+        return raw not in {"0", "false", "no"}
+
+    def _mock(self, messages: List[Message], *, provider_failure: bool = False) -> str:
+        if not self._mock_allowed(provider_failure):
             raise RuntimeError("真实模型暂不可用，当前部署禁止用模拟回复替代，请检查模型配置与服务状态")
         user_query = ""
         for m in messages:

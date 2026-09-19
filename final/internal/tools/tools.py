@@ -27,10 +27,27 @@ MCP_DEFAULT_TIMEOUT_SECONDS = 30
 ALLOW_PRIVATE_MCP_ENV = "AGI_ALLOW_PRIVATE_MCP_ENDPOINTS"
 
 
+def _reject_private_ip(ip: ipaddress._BaseAddress, endpoint: str) -> None:
+    if (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+        or ip.is_unspecified
+    ):
+        raise ValueError(
+            f"为防止 SSRF，MCP endpoint 不允许指向内网地址: {endpoint!r}"
+            f"（确需内网端点可设置 {ALLOW_PRIVATE_MCP_ENV}=1）"
+        )
+
+
 def validate_mcp_endpoint(endpoint: str) -> None:
     """SSRF 防护：MCP 端点只允许 http(s)，且默认拒绝指向内网/回环/链路本地地址。
 
-    只校验 IP 字面量；域名解析后的指向由部署层网络策略负责。
+    只校验 IP 字面量。域名不做注册期解析：fake-ip/TUN 代理等环境会把所有域名
+    解析到保留网段，注册期解析无法区分代理与真实内网目标；
+    域名解析后的指向由部署层出口网络策略负责。
     """
     parsed = urlparse(endpoint)
     if parsed.scheme not in ("http", "https"):
@@ -44,18 +61,7 @@ def validate_mcp_endpoint(endpoint: str) -> None:
         ip = ipaddress.ip_address(host.strip("[]"))
     except ValueError:
         return
-    if (
-        ip.is_private
-        or ip.is_loopback
-        or ip.is_link_local
-        or ip.is_reserved
-        or ip.is_multicast
-        or ip.is_unspecified
-    ):
-        raise ValueError(
-            f"为防止 SSRF，MCP endpoint 不允许指向内网地址: {endpoint!r}"
-            f"（确需内网端点可设置 {ALLOW_PRIVATE_MCP_ENV}=1）"
-        )
+    _reject_private_ip(ip, endpoint)
 
 
 # ─────────────────────────────── 数据结构 ────────────────────────────────────

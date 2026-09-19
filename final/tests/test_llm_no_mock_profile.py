@@ -16,3 +16,18 @@ def test_development_mock_remains_explicitly_available(monkeypatch):
     monkeypatch.setenv('AGI_LLM_ALLOW_MOCK', '1')
     client = Client(SimpleNamespace(is_real_llm=lambda: False))
     assert '模拟 LLM 回复' in client.chat([Message('user', 'hello')])
+
+
+def test_provider_failure_requires_explicit_mock_opt_in(monkeypatch):
+    monkeypatch.delenv('AGI_LLM_ALLOW_MOCK', raising=False)
+    client = Client(SimpleNamespace(is_real_llm=lambda: True))
+    monkeypatch.setattr(client, '_call_chat', lambda *a, **k: (_ for _ in ()).throw(RuntimeError('boom')))
+    with pytest.raises(RuntimeError, match='禁止用模拟回复替代'):
+        client.chat([Message('user', 'hello')])
+
+
+def test_provider_failure_mock_with_explicit_opt_in(monkeypatch):
+    monkeypatch.setenv('AGI_LLM_ALLOW_MOCK', '1')
+    client = Client(SimpleNamespace(is_real_llm=lambda: True))
+    monkeypatch.setattr(client, '_call_chat', lambda *a, **k: (_ for _ in ()).throw(RuntimeError('boom')))
+    assert '模拟 LLM 回复' in client.chat([Message('user', 'hello')])
