@@ -1,0 +1,21 @@
+{
+  "unauthenticated_status": 401,
+  "status": {
+    "rag_mode": "lightweight",
+    "rag_loaded": false
+  },
+  "empty_user_reindex": {
+    "mode": "lightweight",
+    "vectors_written": 0,
+    "chunks": 0,
+    "vectors": 0,
+    "graph_chunks": 0,
+    "relations": 0,
+    "complete": true
+  },
+  "chat": {
+    "answer": "轻量检索版运行正常。",
+    "fallback": false,
+    "error": null
+  }
+}

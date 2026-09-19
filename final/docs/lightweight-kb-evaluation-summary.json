@@ -1,0 +1,48 @@
+{
+  "profile": "existing-kb-lightweight-real-generation",
+  "corpus_sha256": "4ebc22ec488d87f9e71ba7934d8f7da46e7fb94379d71d3762637666976d78f9",
+  "index_report": {
+    "vectors_written": 18,
+    "chunks": 31,
+    "vectors": 31,
+    "graph_chunks": 31,
+    "relations": 568,
+    "complete": true
+  },
+  "source_unchanged": true,
+  "chunk_count": 31,
+  "document_count": 1,
+  "test_count": 50,
+  "real_generation_calls": 43,
+  "tenant_isolation_passed": true,
+  "token_usage": {
+    "prompt_tokens": 35057,
+    "completion_tokens": 33083,
+    "total_tokens": 68140
+  },
+  "responses_with_usage": 47,
+  "refusal_reasons": {
+    "evidence_below_threshold": 7,
+    "model_abstained": 9
+  },
+  "errors": 0,
+  "retrieval_hit_at_k": 1.0,
+  "mrr": 0.9398148148148149,
+  "answerable_response_rate": 0.9444444444444444,
+  "answerable_gold_citation_rate": 0.9444444444444444,
+  "unanswerable_refusal_rate": 1.0,
+  "latency_median_ms": 1560.0900000000001,
+  "latency_p95_ms": 5277.04,
+  "top_k": 3,
+  "fallback_threshold": 0.08,
+  "limitations": [
+    "single document; no cross-document evaluation",
+    "retrieval mode: lightweight; graph enabled only in lightweight mode",
+    "fixed baseline; no threshold tuning or held-out calibration",
+    "citation provenance is not semantic entailment; manual answer review needed",
+    "usage covers synchronous generation only; provider pricing not assumed",
+    "sequential warm-process run; no concurrency or recovery measurement",
+    "usage is process-local; an earlier failed indexing attempt is not included after resume"
+  ],
+  "resumed_index": true
+}

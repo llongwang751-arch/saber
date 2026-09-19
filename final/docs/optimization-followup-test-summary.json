@@ -1,0 +1,206 @@
+{
+  "complete": true,
+  "passed": true,
+  "batches": [
+    {
+      "batch": 1,
+      "returncode": 0,
+      "files": 5,
+      "log": "D:\\\u6d1b\u4f26\u5179\u529b\u4e0d\u505a\u529f\\Desktop\\AGI-Core\u9879\u76ee\\AGI-saber-python\\final\\runtime\\checks-64a958c99b\\batch-1.log",
+      "tests": 66,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    {
+      "batch": 2,
+      "returncode": 0,
+      "files": 5,
+      "log": "D:\\\u6d1b\u4f26\u5179\u529b\u4e0d\u505a\u529f\\Desktop\\AGI-Core\u9879\u76ee\\AGI-saber-python\\final\\runtime\\checks-64a958c99b\\batch-2.log",
+      "tests": 25,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    {
+      "batch": 3,
+      "returncode": 0,
+      "files": 5,
+      "log": "D:\\\u6d1b\u4f26\u5179\u529b\u4e0d\u505a\u529f\\Desktop\\AGI-Core\u9879\u76ee\\AGI-saber-python\\final\\runtime\\checks-64a958c99b\\batch-3.log",
+      "tests": 27,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    {
+      "batch": 4,
+      "returncode": 0,
+      "files": 5,
+      "log": "D:\\\u6d1b\u4f26\u5179\u529b\u4e0d\u505a\u529f\\Desktop\\AGI-Core\u9879\u76ee\\AGI-saber-python\\final\\runtime\\checks-64a958c99b\\batch-4.log",
+      "tests": 16,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    {
+      "batch": 5,
+      "returncode": 0,
+      "files": 5,
+      "log": "D:\\\u6d1b\u4f26\u5179\u529b\u4e0d\u505a\u529f\\Desktop\\AGI-Core\u9879\u76ee\\AGI-saber-python\\final\\runtime\\checks-64a958c99b\\batch-5.log",
+      "tests": 41,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    {
+      "batch": 6,
+      "returncode": 0,
+      "files": 5,
+      "log": "D:\\\u6d1b\u4f26\u5179\u529b\u4e0d\u505a\u529f\\Desktop\\AGI-Core\u9879\u76ee\\AGI-saber-python\\final\\runtime\\checks-64a958c99b\\batch-6.log",
+      "tests": 33,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    {
+      "batch": 7,
+      "returncode": 0,
+      "files": 5,
+      "log": "D:\\\u6d1b\u4f26\u5179\u529b\u4e0d\u505a\u529f\\Desktop\\AGI-Core\u9879\u76ee\\AGI-saber-python\\final\\runtime\\checks-64a958c99b\\batch-7.log",
+      "tests": 52,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    {
+      "batch": 8,
+      "returncode": 0,
+      "files": 5,
+      "log": "D:\\\u6d1b\u4f26\u5179\u529b\u4e0d\u505a\u529f\\Desktop\\AGI-Core\u9879\u76ee\\AGI-saber-python\\final\\runtime\\checks-64a958c99b\\batch-8.log",
+      "tests": 30,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    {
+      "batch": 9,
+      "returncode": 0,
+      "files": 5,
+      "log": "D:\\\u6d1b\u4f26\u5179\u529b\u4e0d\u505a\u529f\\Desktop\\AGI-Core\u9879\u76ee\\AGI-saber-python\\final\\runtime\\checks-64a958c99b\\batch-9.log",
+      "tests": 32,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    {
+      "batch": 10,
+      "returncode": 0,
+      "files": 5,
+      "log": "D:\\\u6d1b\u4f26\u5179\u529b\u4e0d\u505a\u529f\\Desktop\\AGI-Core\u9879\u76ee\\AGI-saber-python\\final\\runtime\\checks-64a958c99b\\batch-10.log",
+      "tests": 25,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    {
+      "batch": 11,
+      "returncode": 0,
+      "files": 5,
+      "log": "D:\\\u6d1b\u4f26\u5179\u529b\u4e0d\u505a\u529f\\Desktop\\AGI-Core\u9879\u76ee\\AGI-saber-python\\final\\runtime\\checks-64a958c99b\\batch-11.log",
+      "tests": 17,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    {
+      "batch": 12,
+      "returncode": 0,
+      "files": 5,
+      "log": "D:\\\u6d1b\u4f26\u5179\u529b\u4e0d\u505a\u529f\\Desktop\\AGI-Core\u9879\u76ee\\AGI-saber-python\\final\\runtime\\checks-64a958c99b\\batch-12.log",
+      "tests": 51,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    {
+      "batch": 13,
+      "returncode": 0,
+      "files": 5,
+      "log": "D:\\\u6d1b\u4f26\u5179\u529b\u4e0d\u505a\u529f\\Desktop\\AGI-Core\u9879\u76ee\\AGI-saber-python\\final\\runtime\\checks-64a958c99b\\batch-13.log",
+      "tests": 41,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    {
+      "batch": 14,
+      "returncode": 0,
+      "files": 5,
+      "log": "D:\\\u6d1b\u4f26\u5179\u529b\u4e0d\u505a\u529f\\Desktop\\AGI-Core\u9879\u76ee\\AGI-saber-python\\final\\runtime\\checks-64a958c99b\\batch-14.log",
+      "tests": 82,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 1
+    },
+    {
+      "batch": 15,
+      "returncode": 0,
+      "files": 5,
+      "log": "D:\\\u6d1b\u4f26\u5179\u529b\u4e0d\u505a\u529f\\Desktop\\AGI-Core\u9879\u76ee\\AGI-saber-python\\final\\runtime\\checks-64a958c99b\\batch-15.log",
+      "tests": 71,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    {
+      "batch": 16,
+      "returncode": 0,
+      "files": 5,
+      "log": "D:\\\u6d1b\u4f26\u5179\u529b\u4e0d\u505a\u529f\\Desktop\\AGI-Core\u9879\u76ee\\AGI-saber-python\\final\\runtime\\checks-64a958c99b\\batch-16.log",
+      "tests": 49,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    {
+      "batch": 17,
+      "returncode": 0,
+      "files": 5,
+      "log": "D:\\\u6d1b\u4f26\u5179\u529b\u4e0d\u505a\u529f\\Desktop\\AGI-Core\u9879\u76ee\\AGI-saber-python\\final\\runtime\\checks-64a958c99b\\batch-17.log",
+      "tests": 11,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    {
+      "batch": 18,
+      "returncode": 0,
+      "files": 5,
+      "log": "D:\\\u6d1b\u4f26\u5179\u529b\u4e0d\u505a\u529f\\Desktop\\AGI-Core\u9879\u76ee\\AGI-saber-python\\final\\runtime\\checks-64a958c99b\\batch-18.log",
+      "tests": 32,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    {
+      "batch": 19,
+      "returncode": 0,
+      "files": 5,
+      "log": "D:\\\u6d1b\u4f26\u5179\u529b\u4e0d\u505a\u529f\\Desktop\\AGI-Core\u9879\u76ee\\AGI-saber-python\\final\\runtime\\checks-64a958c99b\\batch-19.log",
+      "tests": 26,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    {
+      "batch": 20,
+      "returncode": 0,
+      "files": 2,
+      "log": "D:\\\u6d1b\u4f26\u5179\u529b\u4e0d\u505a\u529f\\Desktop\\AGI-Core\u9879\u76ee\\AGI-saber-python\\final\\runtime\\checks-64a958c99b\\batch-20.log",
+      "tests": 12,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    }
+  ]
+}

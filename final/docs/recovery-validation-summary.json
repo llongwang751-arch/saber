@@ -1,0 +1,110 @@
+{
+  "date": "2026-09-19",
+  "scope": "AGI-saber-python/final",
+  "tests": {
+    "full_collection": {
+      "tests": 739,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 1
+    },
+    "passed": 738,
+    "final_artifact_related_regression": {
+      "passed": 28,
+      "overlaps_full_collection": true
+    },
+    "frontend_build": "passed",
+    "real_process_crash_exit_code": 23
+  },
+  "deployment": {
+    "release": "recovery-20260919-05",
+    "verified_files": 19,
+    "sqlite_integrity": "ok",
+    "counts": {
+      "agent_documents": 1,
+      "agent_rag_chunks": 31,
+      "agent_long_term_memory": 6
+    },
+    "recovery_reply_rows_after_repeated_resume": 1,
+    "main_graph_nested_params_preserved": true,
+    "main_graph_lease_released": true,
+    "legacy_alias_active_duplicates": 0,
+    "service": "NRestarts=0\nExecStart={ path=/opt/agi-saber/venv-lightweight/bin/python ; argv[]=/opt/agi-saber/venv-lightweight/bin/python /opt/agi-saber/releases/recovery-20260919-05/serve_private.py ; ignore_errors=no ; start_time=[Sat 2026-09-19 22:00:11 CST] ; stop_time=[n/a] ; pid=848881 ; code=(null) ; status=0/0 }\nMemoryCurrent=212930560\nActiveState=active\n",
+    "backup_timer_enabled": "enabled",
+    "backup_last_result": "Result=success\nExecMainStatus=0\n"
+  },
+  "release_manifest_sha256": "740c73c48be437f60d363178abd8b6e733c41436bc6fbc02e8250318c45a620a",
+  "http_recovery": {
+    "health": 200,
+    "unauthenticated_tasks": 401,
+    "resume_safe": 200,
+    "resume_idempotent": true,
+    "wrong_conversation": 409,
+    "uncertain_operation": 409,
+    "recovery_frontend_served": true,
+    "memory_correction_survived_service_restart": true,
+    "note": "Synthetic server-owned checkpoints in dedicated test account; process-crash verification is local."
+  },
+  "http_memory": {
+    "real_model_chat_turns": 2,
+    "atomic_fact_checks": [
+      {
+        "preference_and_fact_match": true,
+        "fact_id": 5
+      },
+      {
+        "preference_and_fact_match": true,
+        "fact_id": 5
+      }
+    ],
+    "same_fact_id_after_correction": true,
+    "correction_retained_after_background_extraction": true
+  },
+  "http_main_graph": {
+    "real_model_planner_and_summary": true,
+    "task_id": "task-1789826416552799406",
+    "status": "completed",
+    "tools": [
+      "medical_copilot"
+    ],
+    "checkpoint_schema": 1
+  },
+  "backup_primary_restore": {
+    "integrity": "ok",
+    "counts": {
+      "users": 5,
+      "agent_documents": 1,
+      "agent_rag_chunks": 31,
+      "agent_long_term_memory": 4,
+      "agent_chat_history": 21
+    },
+    "destination": "/opt/agi-saber/restore-drills/20260919T134210246013/application.db",
+    "archive": "agi-saber-20260919T133515974505Z.tar.gz",
+    "sha256": "0e8122a915e82e4a2c940a4340b5c2d873cfeada7b40d33a8dde6ffb00eb2408",
+    "bytes": 53370515
+  },
+  "backup_offsite_restore": {
+    "integrity": "ok",
+    "counts": {
+      "users": 5,
+      "agent_documents": 1,
+      "agent_rag_chunks": 31,
+      "agent_long_term_memory": 4,
+      "agent_chat_history": 21
+    },
+    "destination": "/var/lib/agi-saber-backup/restore-drills/20260919T134210176683/application.db",
+    "archive": "agi-saber-20260919T133515974505Z.tar.gz",
+    "sha256": "0e8122a915e82e4a2c940a4340b5c2d873cfeada7b40d33a8dde6ffb00eb2408",
+    "bytes": 53370515
+  },
+  "backup_note": "Verified snapshot precedes synthetic memory tests; daily snapshots are not continuous replication.",
+  "remaining": [
+    "legacy PostgreSQL atomic preference/fact path",
+    "cross-process memory cache invalidation",
+    "safe idle eviction of per-user Agent registry",
+    "background automatic index retry",
+    "independent retrieval quality calibration",
+    "long-running concurrency and full external backend evaluation",
+    "public domain HTTPS and backup failure notification channel"
+  ]
+}

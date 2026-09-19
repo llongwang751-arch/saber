@@ -1,0 +1,46 @@
+{
+  "profile": "isolated-real-persistence",
+  "tenant": "eval-d5c68feb2da34ae596d7a306d6b7d892",
+  "checks": [
+    {
+      "name": "connect_and_bootstrap",
+      "passed": true,
+      "evidence": {
+        "pooled_schema_bootstrap": true
+      },
+      "latency_ms": 210.07
+    },
+    {
+      "name": "repository_read_write_and_isolation",
+      "passed": true,
+      "evidence": {
+        "rag_tenant_isolation": true,
+        "source_metadata": true,
+        "upsert_metadata_retained": true,
+        "preferences_isolation": true,
+        "conversation_isolation": true
+      },
+      "latency_ms": 12.16
+    },
+    {
+      "name": "memory_correction_and_transaction_rollback",
+      "passed": true,
+      "evidence": {
+        "version_cas": true,
+        "outbox_atomic_rollback": true,
+        "failure_injection": "real SQL division by zero after outbox insertion",
+        "events": 6
+      },
+      "latency_ms": 23.22
+    },
+    {
+      "name": "database_restart_recovery",
+      "passed": true,
+      "evidence": {
+        "preferences_history_memory_survived_database_restart": true
+      },
+      "latency_ms": 1279.22
+    }
+  ],
+  "passed": true
+}

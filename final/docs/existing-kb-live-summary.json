@@ -1,0 +1,28 @@
+{
+  "profile": "existing-kb-local-real-generation",
+  "corpus_sha256": "4ebc22ec488d87f9e71ba7934d8f7da46e7fb94379d71d3762637666976d78f9",
+  "source_unchanged": true,
+  "chunk_count": 31,
+  "document_count": 1,
+  "test_count": 50,
+  "real_generation_calls": 40,
+  "tenant_isolation_passed": true,
+  "errors": 0,
+  "retrieval_hit_at_k": 0.8611111111111112,
+  "mrr": 0.8101851851851852,
+  "answerable_response_rate": 0.8333333333333334,
+  "answerable_gold_citation_rate": 0.8055555555555556,
+  "unanswerable_refusal_rate": 1.0,
+  "latency_median_ms": 962.995,
+  "latency_p95_ms": 3189.21,
+  "top_k": 3,
+  "fallback_threshold": 0.08,
+  "limitations": [
+    "single document; no cross-document evaluation",
+    "local retrieval only",
+    "fixed baseline; no threshold tuning or held-out calibration",
+    "citation provenance is not semantic entailment; manual answer review needed",
+    "provider usage not exposed by Client; token counts and price unknown",
+    "sequential warm-process run; no concurrency or recovery measurement"
+  ]
+}

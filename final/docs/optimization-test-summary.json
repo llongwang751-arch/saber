@@ -1,0 +1,133 @@
+[
+  {
+    "batch": 0,
+    "exit": 0,
+    "files": [
+      "tests\\test_advanced_features.py",
+      "tests\\test_agent_framework_eval_dataset.py",
+      "tests\\test_agent_promptctx_alignment.py",
+      "tests\\test_agent_streaming.py",
+      "tests\\test_application_features.py",
+      "tests\\test_async_memory_writer.py",
+      "tests\\test_benchmark_metrics.py",
+      "tests\\test_benchmark_suite.py",
+      "tests\\test_bootstrap_concurrent.py",
+      "tests\\test_build_runtime_component_manifest_cli.py",
+      "tests\\test_cancel_registry.py",
+      "tests\\test_config_alignment.py",
+      "tests\\test_consolidate_routing.py",
+      "tests\\test_dependency_circuits.py",
+      "tests\\test_document_api.py"
+    ],
+    "summary": "........................................................................ [ 62%]\n...........................................                              [100%]\n115 passed, 905 warnings in 15.45s\n"
+  },
+  {
+    "batch": 1,
+    "exit": 0,
+    "files": [
+      "tests\\test_document_library.py",
+      "tests\\test_document_parser.py",
+      "tests\\test_document_repo.py",
+      "tests\\test_document_tools.py",
+      "tests\\test_evaluation_adapter_inputs.py",
+      "tests\\test_evaluation_api.py",
+      "tests\\test_evaluation_evaluators.py",
+      "tests\\test_evaluation_evidence_hardening.py",
+      "tests\\test_evaluation_evolution.py",
+      "tests\\test_evaluation_migrations.py",
+      "tests\\test_evaluation_registry_production.py",
+      "tests\\test_evaluation_release_integrity.py",
+      "tests\\test_evaluation_service.py",
+      "tests\\test_evaluation_store.py",
+      "tests\\test_evaluation_strategy_lifecycle.py"
+    ],
+    "summary": "........................................................................ [ 63%]\n.........................................                                [100%]\n113 passed, 1225 warnings in 88.95s (0:01:28)\n"
+  },
+  {
+    "batch": 2,
+    "exit": 0,
+    "files": [
+      "tests\\test_evaluation_strategy_statistics.py",
+      "tests\\test_experiment_audience_identity.py",
+      "tests\\test_fill_params_from_preference.py",
+      "tests\\test_frontend_evolution_alignment.py",
+      "tests\\test_frontend_main_alignment.py",
+      "tests\\test_frontend_online_experiment_alignment.py",
+      "tests\\test_frontend_strategy_alignment.py",
+      "tests\\test_fts5_index.py",
+      "tests\\test_go_parity_contract.py",
+      "tests\\test_graph_memory_async.py",
+      "tests\\test_graph_runtime.py",
+      "tests\\test_graph_tenant_isolation.py",
+      "tests\\test_harness_v2.py",
+      "tests\\test_http_go_wire_contract.py",
+      "tests\\test_llm_no_mock_profile.py"
+    ],
+    "summary": "........................................................................ [ 75%]\n........................                                                 [100%]\n96 passed, 3391 warnings in 15.01s\n"
+  },
+  {
+    "batch": 3,
+    "exit": 0,
+    "files": [
+      "tests\\test_llm_stream.py",
+      "tests\\test_local_rag_search_performance_contract.py",
+      "tests\\test_local_reranker.py",
+      "tests\\test_longterm_consolidate.py",
+      "tests\\test_longterm_graph_protect.py",
+      "tests\\test_longterm_recall_by_filter.py",
+      "tests\\test_longterm_store_classified.py",
+      "tests\\test_mcp_structured_contract.py",
+      "tests\\test_medical_agent.py",
+      "tests\\test_mem_stack.py",
+      "tests\\test_memory_accessors.py",
+      "tests\\test_memory_consistency_parity.py",
+      "tests\\test_memory_harness_eval_dataset.py",
+      "tests\\test_memory_manager_recall.py",
+      "tests\\test_memory_slot_and_vector.py"
+    ],
+    "summary": "........................................................................ [ 75%]\n.......................                                                  [100%]\n95 passed, 1 warning in 2.86s\n"
+  },
+  {
+    "batch": 4,
+    "exit": 0,
+    "files": [
+      "tests\\test_memory_transactional_projection.py",
+      "tests\\test_memory_writer.py",
+      "tests\\test_online_experiment_api.py",
+      "tests\\test_online_experiment_assignment.py",
+      "tests\\test_online_experiment_chat_integration.py",
+      "tests\\test_online_experiment_runtime_identity.py",
+      "tests\\test_online_experiment_service.py",
+      "tests\\test_online_experiment_statistics.py",
+      "tests\\test_optimization_boundaries.py",
+      "tests\\test_phase4_observability.py",
+      "tests\\test_phase5_structure.py",
+      "tests\\test_preference.py",
+      "tests\\test_rag_alignment.py",
+      "tests\\test_rag_go_parity_contract.py",
+      "tests\\test_rag_lab.py"
+    ],
+    "summary": "........................................................................ [ 35%]\n........................s............................................... [ 70%]\n............................................................             [100%]\n203 passed, 1 skipped, 1677 warnings in 53.67s\n"
+  },
+  {
+    "batch": 5,
+    "exit": 0,
+    "files": [
+      "tests\\test_rag_milvus_adapter.py",
+      "tests\\test_rag_parent_dedup.py",
+      "tests\\test_rag_projection_outbox.py",
+      "tests\\test_rag_quality_eval_dataset.py",
+      "tests\\test_rag_reindex.py",
+      "tests\\test_rerank_circuit_breaker.py",
+      "tests\\test_restore.py",
+      "tests\\test_runtime_identity_deployment_contract.py",
+      "tests\\test_shortterm.py",
+      "tests\\test_subagents.py",
+      "tests\\test_task_graph.py",
+      "tests\\test_threshold_calibration.py",
+      "tests\\test_tool_executor_concurrency.py",
+      "tests\\test_trace_persistence.py"
+    ],
+    "summary": "........................................................................ [ 97%]\n..                                                                       [100%]\n74 passed, 227 warnings in 5.66s\n"
+  }
+]
