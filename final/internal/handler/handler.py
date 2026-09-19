@@ -1,5 +1,6 @@
 # handler — HTTP API 路由处理（FastAPI + Pydantic + CORS）
 import asyncio
+import inspect
 import logging
 import os
 import hashlib
@@ -414,12 +415,14 @@ def setup_routes(
     app.include_router(create_evaluation_router())
     register_shutdown(app, evaluation_service.close)
 
-    # CORS：开发期允许全部，生产可由 cfg.cors_origins 收紧
-    origins = getattr(cfg, "cors_origins", None) or ["*"]
+    # CORS：鉴权走 Authorization 头而非 Cookie，通配符源无需携带凭据。
+    # 显式配置 cors_origins 时才允许 credentials，避免 "*"+credentials 的宽松组合。
+    origins = list(getattr(cfg, "cors_origins", None) or ["*"])
+    allow_credentials = "*" not in origins
     app.add_middleware(
         CORSMiddleware,
         allow_origins=origins,
-        allow_credentials=True,
+        allow_credentials=allow_credentials,
         allow_methods=["*"],
         allow_headers=["*"],
     )
@@ -711,15 +714,27 @@ def setup_routes(
                     def _run_process_stream():
                         response = None
                         started = time.perf_counter()
+                        # 真实 UnifiedAgent 支持复用 HTTP 层取消令牌（断连即取消）；
+                        # 测试替身可能是窄签名，不支持时不强传。
+                        stream_kwargs = (
+                            {"cancel_token": token}
+                            if "cancel_token" in getattr(
+                                inspect.signature(active_agent.process_stream), "parameters", {}
+                            )
+                            else {}
+                        )
                         try:
                             if execution_context is None:
-                                response = active_agent.process_stream(req.message, opts, _on_event)
+                                response = active_agent.process_stream(
+                                    req.message, opts, _on_event, **stream_kwargs,
+                                )
                             else:
                                 response = active_agent.process_stream(
                                     req.message,
                                     opts,
                                     _on_event,
                                     execution_context,
+                                    **stream_kwargs,
                                 )
                             _finish_online_rag_exposure(
                                 request,
@@ -829,6 +844,12 @@ def setup_routes(
 
                 yield _sse("done", data)
             finally:
+                # 客户端断连时生成器在这里退出：先取消该请求的执行链
+                # （LLM 流/图执行/工具循环都会检查该令牌），再关闭事件队列。
+                try:
+                    token.cancel()
+                except Exception:
+                    pass
                 stream_closed.set()
                 if events is not None:
                     # Wake any cancelled asyncio.to_thread(events.get) waiter.

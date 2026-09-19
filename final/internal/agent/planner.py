@@ -56,7 +56,8 @@ def llm_plan_steps(agent, query: str, tools_map: Dict[str, Any], mem_prefix: str
         planner_base = mem_prefix + "\n\n" + planner_base + "\n注意：用户偏好可能影响工具参数选择（如城市、时区等），请在参数中体现。"
 
     try:
-        raw = agent.llm.chat(
+        # 规划属于内部步骤：优先快模型（未配置时 chat_fast 回退主模型）。
+        raw = agent.llm.chat_fast(
             [Message(role="user", content=plan_prompt)],
             system_prompt=planner_base,
         )

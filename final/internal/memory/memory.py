@@ -1189,6 +1189,25 @@ class LongTerm:
                 [int(item.id) + 1 for item in self.items if item.id is not None] or [0]
             )
 
+    def _sync_graph_after_commit(self, changes: CommittedChangeSet) -> None:
+        """Commit 已落库后同步图层：删除被合并/淘汰的节点，更新存续节点。
+
+        与 main GraphAwareConsolidate 的图同步语义对齐。失败只告警，
+        不影响已提交的 PG 状态（图层可由 bulk_index 全量重建兜底）。
+        """
+        graph = self.graph_memory
+        if graph is None:
+            return
+        try:
+            for record in list(getattr(changes, "deletes", []) or []):
+                graph.delete_from_graph(int(record.memory_id))
+            for record in list(getattr(changes, "upserts", []) or []):
+                graph.update_node(
+                    self._item_from_committed(record, Item(content=str(getattr(record, "content", "") or "")))
+                )
+        except Exception as exc:
+            logger.warning("⚠️  graph_memory consolidate 同步失败: %s", exc)
+
     def consolidate_committed(self) -> ConsolidationResult:
         """Persist one consolidation plan atomically, then update the cache."""
 
@@ -1207,6 +1226,9 @@ class LongTerm:
             # PostgreSQL already committed.  Reloading is the only safe answer
             # when another local mutation raced cache application.
             self.load_from_storage(strict=True)
+        # 提交后同步图层：删除被合并/淘汰的节点，更新存续节点。
+        # plan_consolidation 已做中心度保护，这里的删除集与 PG 删除集一致。
+        self._sync_graph_after_commit(changes)
         with self._lock:
             self._last_consolidate_ts = time.time()
             self._items_since_last = 0

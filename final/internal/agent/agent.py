@@ -13,7 +13,6 @@
 import json
 import inspect
 import logging
-import re
 import threading
 import time
 import uuid
@@ -64,7 +63,6 @@ from .memory_writer import (
     maybe_consolidate_memory,
 )
 from .restore import init_knowledge_graph, restore_from_db, restore_rag_from_db
-from .router import detect_tool
 from .planner import llm_plan_graph, needs_subagent_plan, subagent_pipeline_nodes
 from .status import infra_status, status as build_status
 from .subagents import register_builtin_subagents
@@ -310,11 +308,19 @@ class UnifiedAgent:
         query: str,
         opts: ChatOptions,
         execution_context: Optional[RequestExecutionContext] = None,
+        cancel_token=None,
     ) -> Response:
         if opts.conversation_id and self._conversations is not None:
             with self._conversations.lease(opts.conversation_id) as scoped:
-                return scoped.process_with_options(query, ChatOptions(use_rag=opts.use_rag), execution_context)
-        token, unregister = self._cancel_registry.register()
+                return scoped.process_with_options(
+                    query, ChatOptions(use_rag=opts.use_rag), execution_context,
+                    cancel_token=cancel_token,
+                )
+        if cancel_token is not None:
+            # 复用调用方（HTTP 层）的取消令牌：客户端断连时取消能穿透到执行链。
+            token, unregister = cancel_token, lambda: None
+        else:
+            token, unregister = self._cancel_registry.register()
         try:
             return self._dispatch(
                 query,
@@ -331,11 +337,18 @@ class UnifiedAgent:
         opts: ChatOptions,
         on_event,
         execution_context: Optional[RequestExecutionContext] = None,
+        cancel_token=None,
     ) -> Response:
         if opts.conversation_id and self._conversations is not None:
             with self._conversations.lease(opts.conversation_id) as scoped:
-                return scoped.process_stream(query, ChatOptions(use_rag=opts.use_rag), on_event, execution_context)
-        token, unregister = self._cancel_registry.register()
+                return scoped.process_stream(
+                    query, ChatOptions(use_rag=opts.use_rag), on_event,
+                    execution_context, cancel_token=cancel_token,
+                )
+        if cancel_token is not None:
+            token, unregister = cancel_token, lambda: None
+        else:
+            token, unregister = self._cancel_registry.register()
         try:
             return self._dispatch(
                 query,
@@ -671,10 +684,6 @@ class UnifiedAgent:
                 force_subagent_plan=True,
             )
             self._apply_graph_tool_calls(resp)
-        elif mode == "tool":
-            resp.answer, resp.tool_call = self._run_tool_from_set(
-                query, route_tools, mem_prefix, hist_msgs, token, on_event
-            )
         elif mode == "rag":
             resp.answer, resp.search_results, resp.rag_trace = self._run_rag_query_with_trace(
                 query,
@@ -950,26 +959,11 @@ class UnifiedAgent:
             on_token=lambda content: _emit(on_event, "token", {"content": content}),
         )
 
-    # ── 工具调用（tool 模式） ──────────────────────────────────────────────
+    # ── 工具参数与偏好 ────────────────────────────────────────────────────
 
-    def _filter_tools(self, names: List[str]) -> Dict[str, Tool]:
-        return self.tool_executor.filter_tools(names)
-
-    def _parse_tool_params(self, tool_name: str, user_input: str) -> Dict[str, str]:
-        params: Dict[str, str] = {}
-        if tool_name == "get_weather":
-            match = re.search(r"(天气|温度)\s*([^\s,，。？?!！]+)", user_input)
-            if match:
-                params["city"] = match.group(2)
-        elif tool_name in {"search_web", "rag_search"}:
-            match = re.search(r"(搜索|查找|知识|文档)\s*(.*)", user_input)
-            if match and match.group(2).strip():
-                params["query"] = match.group(2).strip()
-            else:
-                params["query"] = user_input
-        return params
-
-    # 偏好键 → 候选工具参数名（与 main 分支 fillParamsFromPreference 完全一致）
+    # 偏好键 → 候选工具参数名（与 main 分支 fillParamsFromPreference 完全一致）。
+    # 当前 planner 直接产出工具参数，此映射未接入执行链；作为独立纯逻辑保留
+    # （有单测覆盖），供未来工具执行路径复用。
     _PREFERENCE_PARAM_MAP = {
         "城市": ("city", "location", "location_name"),
         "时区": ("timezone", "tz", "time_zone"),
@@ -1000,33 +994,6 @@ class UnifiedAgent:
                 existing = params.get(name)
                 if existing is None or str(existing) == "":
                     params[name] = value
-
-    def _run_tool_from_set(self, query: str, tools_map: Dict[str, Tool], mem_prefix: str, hist_msgs: List[Message], token=None, on_event=None):
-        tool_name = detect_tool(query, tools_map)
-        if not tool_name:
-            return self._chat_response(mem_prefix, hist_msgs, token, on_event), None
-        params = self._parse_tool_params(tool_name, query)
-        # 偏好补全：在 tool_executor.call 之前注入偏好（对应 Go 版 fillParamsFromPreference）
-        self._fill_params_from_preference(params)
-        from internal.agent.tool_execution import guarded_tool_attempt
-        result = guarded_tool_attempt(self, tools_map[tool_name], tool_name, params, token,
-            max(1.0, self.cfg.step_timeout_ms / 1000), f"direct:{time.time_ns()}")
-        answer = result.payload if result.success else f"工具调用失败: {result.error}"
-        tool_call = {
-            "tool_name": tool_name,
-            "params": params,
-            "tool_result": result.payload,
-            "success": result.success,
-            "error": str(result.error) if result.error else None,
-        }
-        _emit(on_event, "tool_call", tool_call)
-        if result.success:
-            system_prompt = "你是一个善于综合信息的AI助手。结合你掌握的用户信息，使回答更个性化。"
-            if mem_prefix:
-                system_prompt = mem_prefix + "\n\n" + system_prompt
-            user_msg = f"用户问：{query}\n工具 {tool_name} 返回结果：{result.payload}\n请根据结果自然地回答用户。"
-            answer = self._chat_llm(system_prompt, [Message(role="user", content=user_msg)], token, on_event)
-        return answer, tool_call
 
     # ── 图调度（统一 react 入口） ──────────────────────────────────────────
 
