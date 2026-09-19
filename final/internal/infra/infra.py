@@ -598,6 +598,10 @@ class Infrastructure:
             "ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS superseded_at TIMESTAMPTZ",
             "ALTER TABLE long_term_memory ADD COLUMN IF NOT EXISTS supersedes JSONB NOT NULL DEFAULT '[]'::jsonb",
             "CREATE INDEX IF NOT EXISTS idx_ltm_active_user_id ON long_term_memory(user_id, id) WHERE deleted_at IS NULL",
+            # 注意：此 memory_outbox 属于 PostgreSQL 业务库，仅由 repo/memory_projection.py
+            # （locked_by/locked_at 列）读写。alembic 迁移里的同名表属于应用/评测
+            # SQLite 库（lease_owner/lease_until 列，见 internal/application/models.py），
+            # 两套存储互相独立，改列名前先确认目标库，勿混用。
             """CREATE TABLE IF NOT EXISTS memory_outbox (
                 id BIGSERIAL PRIMARY KEY, event_id UUID NOT NULL UNIQUE,
                 aggregate_id BIGINT NOT NULL, user_id TEXT NOT NULL,
