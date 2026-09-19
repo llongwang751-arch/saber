@@ -172,60 +172,49 @@ class PGRepo:
             tags = []
         category = category or "general"
         emb_param = _emb_to_str(embedding)
-        conn = self.client.conn
-        if conn is None:
-            raise MemoryUnavailable("memorytx: postgres unavailable")
-        prior_autocommit = conn.autocommit
         try:
-            conn.autocommit = False
-            with conn.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO long_term_memory "
-                    "(user_id, content, importance, embedding, created_at, last_accessed, "
-                    " category, tags, slot_hint, score, version, updated_at) "
-                    "VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s, %s::jsonb, %s, %s, 1, NOW()) "
-                    "RETURNING id,created_at,last_accessed,EXTRACT(EPOCH FROM updated_at)",
-                    (user_id, content, importance, emb_param,
-                     float(created_at), float(last_accessed),
-                     category, json.dumps(list(tags)), slot_hint or "", float(score)),
-                )
-                row = cur.fetchone()
-                if not row:
-                    raise RuntimeError("memorytx: insert returned no authoritative row")
-                memory_id = int(row[0])
-                record = MemoryRecord(
-                    memory_id=memory_id,
-                    user_id=user_id,
-                    content=content,
-                    importance=float(importance),
-                    embedding=_embedding_list(embedding),
-                    category=category,
-                    tags=list(tags),
-                    slot_hint=slot_hint or "",
-                    version=1,
-                    created_at=float(row[1] or created_at),
-                    last_accessed=float(row[2] or last_accessed),
-                    updated_at=float(row[3] or time.time()),
-                )
-                record.content_hash = compute_content_hash(record)
-                cur.execute(
-                    "UPDATE long_term_memory SET content_hash=%s WHERE id=%s AND version=1",
-                    (record.content_hash, memory_id),
-                )
-                if cur.rowcount != 1:
-                    raise RuntimeError("memorytx: content hash update affected no row")
-                _insert_projection_events(cur, record)
-            conn.commit()
-            return record
+            with self.client.transaction() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO long_term_memory "
+                        "(user_id, content, importance, embedding, created_at, last_accessed, "
+                        " category, tags, slot_hint, score, version, updated_at) "
+                        "VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s, %s::jsonb, %s, %s, 1, NOW()) "
+                        "RETURNING id,created_at,last_accessed,EXTRACT(EPOCH FROM updated_at)",
+                        (user_id, content, importance, emb_param,
+                         float(created_at), float(last_accessed),
+                         category, json.dumps(list(tags)), slot_hint or "", float(score)),
+                    )
+                    row = cur.fetchone()
+                    if not row:
+                        raise RuntimeError("memorytx: insert returned no authoritative row")
+                    memory_id = int(row[0])
+                    record = MemoryRecord(
+                        memory_id=memory_id,
+                        user_id=user_id,
+                        content=content,
+                        importance=float(importance),
+                        embedding=_embedding_list(embedding),
+                        category=category,
+                        tags=list(tags),
+                        slot_hint=slot_hint or "",
+                        version=1,
+                        created_at=float(row[1] or created_at),
+                        last_accessed=float(row[2] or last_accessed),
+                        updated_at=float(row[3] or time.time()),
+                    )
+                    record.content_hash = compute_content_hash(record)
+                    cur.execute(
+                        "UPDATE long_term_memory SET content_hash=%s WHERE id=%s AND version=1",
+                        (record.content_hash, memory_id),
+                    )
+                    if cur.rowcount != 1:
+                        raise RuntimeError("memorytx: content hash update affected no row")
+                    _insert_projection_events(cur, record)
+                return record
         except Exception as e:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
             logger.warning("⚠️  长期记忆事务提交失败: %s", e)
             raise
-        finally:
-            conn.autocommit = prior_autocommit
 
     # 默认写入：保留旧 ``save -> id`` 协议，但失败必须抛出。
     def save(self, content: str, importance: float, embedding_json,
@@ -378,48 +367,37 @@ class PGRepo:
     def update_committed(self, item_id: int, content: str, importance: float, embedding,
                          *, expected_version: int | None = None,
                          user_id: str = "default_user") -> MemoryRecord:
-        if self.client is None or not self.client.is_real():
+        if self.client is None or not self.client.is_real() or self.client.conn is None:
             raise MemoryUnavailable("memorytx: postgres unavailable")
-        conn = self.client.conn
-        if conn is None:
-            raise MemoryUnavailable("memorytx: postgres unavailable")
-        prior_autocommit = conn.autocommit
         try:
-            conn.autocommit = False
-            with conn.cursor() as cur:
-                record = _locked_record(cur, item_id, user_id)
-                if record is None or record.deleted_at is not None:
-                    raise LookupError(f"memorytx: memory not found: {item_id}")
-                if expected_version is not None and record.version != int(expected_version):
-                    raise MemoryVersionConflict("memorytx: version conflict")
-                record.content = content
-                record.importance = float(importance)
-                record.embedding = _embedding_list(embedding)
-                record.version += 1
-                record.updated_at = time.time()
-                record.last_accessed = record.updated_at
-                record.content_hash = compute_content_hash(record)
-                cur.execute(
-                    "UPDATE long_term_memory SET content=%s,importance=%s,embedding=%s::jsonb,"
-                    "version=%s,updated_at=NOW(),last_accessed=%s,content_hash=%s "
-                    "WHERE id=%s AND user_id=%s AND version=%s",
-                    (content, importance, json.dumps(record.embedding), record.version, record.last_accessed,
-                     record.content_hash, item_id, user_id, record.version - 1),
-                )
-                if cur.rowcount != 1:
-                    raise MemoryVersionConflict("memorytx: version conflict")
-                _insert_projection_events(cur, record)
-            conn.commit()
-            return record
+            with self.client.transaction() as conn:
+                with conn.cursor() as cur:
+                    record = _locked_record(cur, item_id, user_id)
+                    if record is None or record.deleted_at is not None:
+                        raise LookupError(f"memorytx: memory not found: {item_id}")
+                    if expected_version is not None and record.version != int(expected_version):
+                        raise MemoryVersionConflict("memorytx: version conflict")
+                    record.content = content
+                    record.importance = float(importance)
+                    record.embedding = _embedding_list(embedding)
+                    record.version += 1
+                    record.updated_at = time.time()
+                    record.last_accessed = record.updated_at
+                    record.content_hash = compute_content_hash(record)
+                    cur.execute(
+                        "UPDATE long_term_memory SET content=%s,importance=%s,embedding=%s::jsonb,"
+                        "version=%s,updated_at=NOW(),last_accessed=%s,content_hash=%s "
+                        "WHERE id=%s AND user_id=%s AND version=%s",
+                        (content, importance, json.dumps(record.embedding), record.version, record.last_accessed,
+                         record.content_hash, item_id, user_id, record.version - 1),
+                    )
+                    if cur.rowcount != 1:
+                        raise MemoryVersionConflict("memorytx: version conflict")
+                    _insert_projection_events(cur, record)
+                return record
         except Exception as e:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
             logger.warning("⚠️  长期记忆更新失败 (id=%d): %s", item_id, e)
             raise
-        finally:
-            conn.autocommit = prior_autocommit
 
     # 修改一条长期记忆；旧调用者可忽略返回的权威记录。
     def update(self, item_id: int, content: str, importance: float, embedding_json,
@@ -437,49 +415,38 @@ class PGRepo:
                                     slot_hint: str, last_accessed: float,
                                     *, expected_version: int | None = None,
                                     user_id: str = "default_user") -> MemoryRecord:
-        if self.client is None or not self.client.is_real():
+        if self.client is None or not self.client.is_real() or self.client.conn is None:
             raise MemoryUnavailable("memorytx: postgres unavailable")
-        conn = self.client.conn
-        if conn is None:
-            raise MemoryUnavailable("memorytx: postgres unavailable")
-        prior_autocommit = conn.autocommit
         try:
-            conn.autocommit = False
-            with conn.cursor() as cur:
-                record = _locked_record(cur, item_id, user_id)
-                if record is None or record.deleted_at is not None:
-                    raise LookupError(f"memorytx: memory not found: {item_id}")
-                if expected_version is not None and record.version != int(expected_version):
-                    raise MemoryVersionConflict("memorytx: version conflict")
-                record.importance = float(importance)
-                record.tags = list(tags or [])
-                record.category = category or ""
-                record.slot_hint = slot_hint or ""
-                record.last_accessed = float(last_accessed)
-                record.version += 1
-                record.updated_at = time.time()
-                record.content_hash = compute_content_hash(record)
-                cur.execute(
-                    "UPDATE long_term_memory SET importance=%s,tags=%s::jsonb,category=%s,slot_hint=%s,"
-                    "last_accessed=%s,version=%s,updated_at=NOW(),content_hash=%s "
-                    "WHERE id=%s AND user_id=%s AND version=%s",
-                    (record.importance, json.dumps(record.tags), record.category, record.slot_hint,
-                     record.last_accessed, record.version, record.content_hash, item_id, user_id, record.version - 1),
-                )
-                if cur.rowcount != 1:
-                    raise MemoryVersionConflict("memorytx: version conflict")
-                _insert_projection_events(cur, record)
-            conn.commit()
-            return record
+            with self.client.transaction() as conn:
+                with conn.cursor() as cur:
+                    record = _locked_record(cur, item_id, user_id)
+                    if record is None or record.deleted_at is not None:
+                        raise LookupError(f"memorytx: memory not found: {item_id}")
+                    if expected_version is not None and record.version != int(expected_version):
+                        raise MemoryVersionConflict("memorytx: version conflict")
+                    record.importance = float(importance)
+                    record.tags = list(tags or [])
+                    record.category = category or ""
+                    record.slot_hint = slot_hint or ""
+                    record.last_accessed = float(last_accessed)
+                    record.version += 1
+                    record.updated_at = time.time()
+                    record.content_hash = compute_content_hash(record)
+                    cur.execute(
+                        "UPDATE long_term_memory SET importance=%s,tags=%s::jsonb,category=%s,slot_hint=%s,"
+                        "last_accessed=%s,version=%s,updated_at=NOW(),content_hash=%s "
+                        "WHERE id=%s AND user_id=%s AND version=%s",
+                        (record.importance, json.dumps(record.tags), record.category, record.slot_hint,
+                         record.last_accessed, record.version, record.content_hash, item_id, user_id, record.version - 1),
+                    )
+                    if cur.rowcount != 1:
+                        raise MemoryVersionConflict("memorytx: version conflict")
+                    _insert_projection_events(cur, record)
+                return record
         except Exception as e:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
             logger.warning("⚠️  长期记忆 update_classified 失败 (id=%d): %s", item_id, e)
             raise
-        finally:
-            conn.autocommit = prior_autocommit
 
     # dedup 命中后只更新 Schema-driven 字段（不动 content/embedding）。
     def update_classified(self, item_id: int, importance: float,
@@ -516,10 +483,7 @@ class PGRepo:
             raise ValueError("memorytx: consolidation crossed tenant boundary")
         if self.client is None or not self.client.is_real() or self.client.conn is None:
             raise MemoryUnavailable("memorytx: postgres unavailable")
-        conn = self.client.conn
-        prior_autocommit = conn.autocommit
-        try:
-            conn.autocommit = False
+        with self.client.transaction() as conn:
             changes = CommittedChangeSet()
             with conn.cursor() as cur:
                 for update in updates:
@@ -593,66 +557,46 @@ class PGRepo:
                         raise MemoryVersionConflict("memorytx: version conflict")
                     _insert_projection_events(cur, record, deleted=True)
                     changes.deletes.append(record)
-            conn.commit()
             return changes
-        except Exception:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
-            raise
-        finally:
-            conn.autocommit = prior_autocommit
 
     def delete_committed(self, ids: List[int], *, user_id: str = "default_user",
                          expected_versions: dict[int, int] | None = None) -> list[MemoryRecord]:
         if not ids:
             return []
-        if self.client is None or not self.client.is_real():
+        if self.client is None or not self.client.is_real() or self.client.conn is None:
             raise MemoryUnavailable("memorytx: postgres unavailable")
-        conn = self.client.conn
-        if conn is None:
-            raise MemoryUnavailable("memorytx: postgres unavailable")
-        prior_autocommit = conn.autocommit
         try:
-            conn.autocommit = False
-            committed: list[MemoryRecord] = []
-            with conn.cursor() as cur:
-                for item_id in sorted({int(value) for value in ids}):
-                    record = _locked_record(cur, item_id, user_id)
-                    if record is None or record.deleted_at is not None:
-                        if expected_versions and item_id in expected_versions:
+            with self.client.transaction() as conn:
+                committed: list[MemoryRecord] = []
+                with conn.cursor() as cur:
+                    for item_id in sorted({int(value) for value in ids}):
+                        record = _locked_record(cur, item_id, user_id)
+                        if record is None or record.deleted_at is not None:
+                            if expected_versions and item_id in expected_versions:
+                                raise MemoryVersionConflict("memorytx: version conflict")
+                            continue
+                        if expected_versions and record.version != int(expected_versions.get(item_id, record.version)):
                             raise MemoryVersionConflict("memorytx: version conflict")
-                        continue
-                    if expected_versions and record.version != int(expected_versions.get(item_id, record.version)):
-                        raise MemoryVersionConflict("memorytx: version conflict")
-                    record.version += 1
-                    record.updated_at = time.time()
-                    record.deleted_at = record.updated_at
-                    record.superseded = True
-                    record.superseded_at = record.updated_at
-                    record.content_hash = compute_content_hash(record)
-                    cur.execute(
-                        "UPDATE long_term_memory SET deleted_at=NOW(),status='superseded',version=%s,"
-                        "superseded_at=NOW(),updated_at=NOW(),content_hash=%s "
-                        "WHERE id=%s AND user_id=%s AND version=%s",
-                        (record.version, record.content_hash, item_id, user_id, record.version - 1),
-                    )
-                    if cur.rowcount != 1:
-                        raise MemoryVersionConflict("memorytx: version conflict")
-                    _insert_projection_events(cur, record, deleted=True)
-                    committed.append(record)
-            conn.commit()
-            return committed
+                        record.version += 1
+                        record.updated_at = time.time()
+                        record.deleted_at = record.updated_at
+                        record.superseded = True
+                        record.superseded_at = record.updated_at
+                        record.content_hash = compute_content_hash(record)
+                        cur.execute(
+                            "UPDATE long_term_memory SET deleted_at=NOW(),status='superseded',version=%s,"
+                            "superseded_at=NOW(),updated_at=NOW(),content_hash=%s "
+                            "WHERE id=%s AND user_id=%s AND version=%s",
+                            (record.version, record.content_hash, item_id, user_id, record.version - 1),
+                        )
+                        if cur.rowcount != 1:
+                            raise MemoryVersionConflict("memorytx: version conflict")
+                        _insert_projection_events(cur, record, deleted=True)
+                        committed.append(record)
+                return committed
         except Exception as e:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
             logger.warning("⚠️  长期记忆批量删除失败: %s", e)
             raise
-        finally:
-            conn.autocommit = prior_autocommit
 
     # 批量删除；实际是带版本号的 tombstone，旧调用者可忽略返回值。
     def delete(self, ids: List[int], user_id: str = "default_user") -> list[MemoryRecord]:
@@ -670,56 +614,45 @@ class PGRepo:
     ) -> list[MemoryRecord]:
         if not ids:
             return []
-        if self.client is None or not self.client.is_real():
+        if self.client is None or not self.client.is_real() or self.client.conn is None:
             raise MemoryUnavailable("memorytx: postgres unavailable")
-        conn = self.client.conn
-        if conn is None:
-            raise MemoryUnavailable("memorytx: postgres unavailable")
-        prior_autocommit = conn.autocommit
         try:
-            conn.autocommit = False
-            committed: list[MemoryRecord] = []
-            with conn.cursor() as cur:
-                for item_id in sorted({int(value) for value in ids}):
-                    record = _locked_record(cur, item_id, user_id)
-                    if record is None or record.deleted_at is not None:
-                        if expected_versions and item_id in expected_versions:
+            with self.client.transaction() as conn:
+                committed: list[MemoryRecord] = []
+                with conn.cursor() as cur:
+                    for item_id in sorted({int(value) for value in ids}):
+                        record = _locked_record(cur, item_id, user_id)
+                        if record is None or record.deleted_at is not None:
+                            if expected_versions and item_id in expected_versions:
+                                raise MemoryVersionConflict("memorytx: version conflict")
+                            continue
+                        if expected_versions and record.version != int(
+                            expected_versions.get(item_id, record.version)
+                        ):
                             raise MemoryVersionConflict("memorytx: version conflict")
-                        continue
-                    if expected_versions and record.version != int(
-                        expected_versions.get(item_id, record.version)
-                    ):
-                        raise MemoryVersionConflict("memorytx: version conflict")
-                    record.quarantined = status == "quarantined"
-                    record.superseded = status == "superseded"
-                    record.quarantine_reason = reason or ""
-                    record.superseded_at = time.time() if record.superseded else None
-                    record.version += 1
-                    record.updated_at = time.time()
-                    record.content_hash = compute_content_hash(record)
-                    cur.execute(
-                        "UPDATE long_term_memory SET status=%s,quarantine_reason=%s,superseded_by=%s,"
-                        "superseded_at=%s,supersedes=%s::jsonb,version=%s,updated_at=NOW(),content_hash=%s "
-                        "WHERE id=%s AND user_id=%s AND version=%s",
-                        (status, reason, superseded_by, record.superseded_at,
-                         json.dumps(record.supersedes), record.version, record.content_hash,
-                         item_id, user_id, record.version - 1),
-                    )
-                    if cur.rowcount != 1:
-                        raise MemoryVersionConflict("memorytx: version conflict")
-                    _insert_projection_events(cur, record)
-                    committed.append(record)
-            conn.commit()
-            return committed
+                        record.quarantined = status == "quarantined"
+                        record.superseded = status == "superseded"
+                        record.quarantine_reason = reason or ""
+                        record.superseded_at = time.time() if record.superseded else None
+                        record.version += 1
+                        record.updated_at = time.time()
+                        record.content_hash = compute_content_hash(record)
+                        cur.execute(
+                            "UPDATE long_term_memory SET status=%s,quarantine_reason=%s,superseded_by=%s,"
+                            "superseded_at=%s,supersedes=%s::jsonb,version=%s,updated_at=NOW(),content_hash=%s "
+                            "WHERE id=%s AND user_id=%s AND version=%s",
+                            (status, reason, superseded_by, record.superseded_at,
+                             json.dumps(record.supersedes), record.version, record.content_hash,
+                             item_id, user_id, record.version - 1),
+                        )
+                        if cur.rowcount != 1:
+                            raise MemoryVersionConflict("memorytx: version conflict")
+                        _insert_projection_events(cur, record)
+                        committed.append(record)
+                return committed
         except Exception as e:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
             logger.warning("⚠️  长期记忆状态更新失败: %s", e)
             raise
-        finally:
-            conn.autocommit = prior_autocommit
 
     def mark_superseded_committed(
         self,
@@ -738,11 +671,8 @@ class PGRepo:
             return CommittedChangeSet()
         if self.client is None or not self.client.is_real() or self.client.conn is None:
             raise MemoryUnavailable("memorytx: postgres unavailable")
-        conn = self.client.conn
-        prior_autocommit = conn.autocommit
         now = time.time()
-        try:
-            conn.autocommit = False
+        with self.client.transaction() as conn:
             changes = CommittedChangeSet()
             with conn.cursor() as cur:
                 records: dict[int, MemoryRecord] = {}
@@ -800,16 +730,7 @@ class PGRepo:
                         raise MemoryVersionConflict("memorytx: version conflict")
                     _insert_projection_events(cur, replacement)
                     changes.upserts.append(replacement)
-            conn.commit()
             return changes
-        except Exception:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
-            raise
-        finally:
-            conn.autocommit = prior_autocommit
 
     def set_status(
         self,

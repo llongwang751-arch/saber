@@ -34,12 +34,13 @@ class Store:
         if not req.content_md:
             raise ValueError("content_md is required")
 
-        conn = self._require_conn()
+        self._require_conn()
         created = not bool(req.document_id)
         doc_id = req.document_id or new_id("doc")
         version = 1
 
-        try:
+        # 专用连接上的真实事务：文档行与版本行要么同时落库，要么都不落。
+        with self.pg.transaction() as conn:
             with conn.cursor() as cur:
                 if created:
                     cur.execute(
@@ -99,13 +100,6 @@ class Store:
                         json.dumps(req.metadata or {}, ensure_ascii=False),
                     ),
                 )
-            conn.commit()
-        except Exception:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
-            raise
 
         doc, ver = self.get(doc_id)
         return WriteResult(document=doc, version=ver, created=created)

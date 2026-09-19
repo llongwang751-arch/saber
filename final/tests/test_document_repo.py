@@ -1,5 +1,7 @@
 import pytest
 
+from contextlib import contextmanager
+
 from internal.document.library import WriteRequest
 from internal.repo.documentrepo import Store
 
@@ -73,10 +75,20 @@ class RecordingPG:
     def __init__(self, existing_document_id=""):
         self.conn = RecordingConn(existing_document_id)
         self.executed = self.conn.executed
-        self.commits = 0
+        self.transactions = 0
 
     def is_real(self):
         return True
+
+    @contextmanager
+    def transaction(self):
+        self.transactions += 1
+        try:
+            yield self.conn
+        except Exception:
+            self.conn.rollback()
+            raise
+        self.conn.commit()
 
 
 class RecordingConn:

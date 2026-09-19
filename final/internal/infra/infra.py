@@ -5,9 +5,10 @@
 # (connect / schema bootstrap / health) 与跨域装配 self.repo 仓储入口。
 import json
 import logging
+from contextlib import contextmanager
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 from config.config import APIConfig
 from internal.repo import (
@@ -26,8 +27,10 @@ logger = logging.getLogger(__name__)
 # 尝试导入可选依赖，失败则标记不可用
 try:
     import psycopg2
+    from psycopg2.pool import ThreadedConnectionPool
     _HAS_PG = True
 except ImportError:
+    ThreadedConnectionPool = None  # type: ignore
     _HAS_PG = False
 
 try:
@@ -83,17 +86,62 @@ class LongTermRow:
 # 避免重复 connect。
 
 class _PGAdapter:
-    """把 psycopg2 raw connection 包成 PostgresClient-like 接口供 repo 使用。"""
+    """把 psycopg2 raw connection 包成 PostgresClient-like 接口供 repo 使用。
 
-    def __init__(self, conn):
+    单条语句走 bootstrap 连接（autocommit）；多语句事务必须走 ``transaction()``，
+    从独立连接池 checkout 专用连接，避免并发线程在同一连接上互踩事务。
+    """
+
+    def __init__(self, conn, pool=None):
         self._conn = conn
+        self._pool = pool
 
     def is_real(self) -> bool:
-        return self._conn is not None
+        return self._conn is not None or self._pool is not None
 
     @property
     def conn(self):
         return self._conn
+
+    @contextmanager
+    def transaction(self) -> Iterator[Any]:
+        """专用连接上的一个事务：with 块正常退出提交，异常回滚。"""
+        if self._pool is not None:
+            conn = self._pool.getconn()
+            try:
+                conn.autocommit = False
+                yield conn
+                conn.commit()
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                raise
+            finally:
+                try:
+                    self._pool.putconn(conn)
+                except Exception:
+                    pass
+            return
+
+        # 无池时的兜底：退回共享连接上的事务（保留旧行为，生产路径始终有池）。
+        conn = self._conn
+        if conn is None:
+            raise RuntimeError("postgres unavailable")
+        prior_autocommit = conn.autocommit
+        try:
+            conn.autocommit = False
+            yield conn
+            conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.autocommit = prior_autocommit
 
     def query(self, sql: str, params: Optional[Sequence[Any]] = None) -> List[Tuple[Any, ...]]:
         if self._conn is None:
@@ -312,6 +360,7 @@ class Infrastructure:
         self.cfg = cfg
         self.ready = Status()
         self._pg = None
+        self._pg_pool = None
         self._es = None
         self._kafka_producer = None
         self._milvus = None
@@ -327,7 +376,7 @@ class Infrastructure:
         # ─── repo 装配（统一持久化入口） ────────────────────────────────
         # 业务侧应通过 inf.repo.<domain>.<method>(...) 访问；此处不重复 connect，
         # 只把已有句柄包成符合 internal.platform 接口的 thin adapter 注入 repo。
-        pg_client = _PGAdapter(self._pg)
+        pg_client = _PGAdapter(self._pg, pool=self._pg_pool)
         es_client = _ESAdapter(self._es)
         milvus_client = _MilvusAdapter(self._milvus)
         kafka_client = _KafkaAdapter(self._kafka_producer, self.cfg, self.ready)
@@ -358,6 +407,14 @@ class Infrastructure:
             with self._pg.cursor() as cur:
                 cur.execute("SELECT 1")
             self.ready.postgresql = "connected"
+            # 事务专用连接池：memorytx / documentrepo 等多语句事务从池中
+            # checkout 独立连接，避免在共享连接上切换 autocommit 的并发竞态。
+            self._pg_pool = None
+            if ThreadedConnectionPool is not None:
+                try:
+                    self._pg_pool = ThreadedConnectionPool(1, 10, self.cfg.pg_dsn())
+                except Exception as pool_err:
+                    logger.warning("⚠️  PG 事务连接池创建失败，退回共享连接事务: %s", pool_err)
             self._init_pg_schema()
             logger.info("✅ PostgreSQL 已连接: %s", self.cfg.pg_dsn())
         except Exception as e:
@@ -787,6 +844,11 @@ class Infrastructure:
                 self._pg.close()
             except Exception as e:
                 logger.warning("⚠️  PG 关闭失败: %s", e)
+        if self._pg_pool is not None:
+            try:
+                self._pg_pool.closeall()
+            except Exception as e:
+                logger.warning("⚠️  PG 连接池关闭失败: %s", e)
         if self._kafka_producer:
             try:
                 self._kafka_producer.flush()
