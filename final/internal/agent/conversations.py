@@ -79,10 +79,13 @@ class ConversationPool:
         # Rebind tools whose closures access the conversation's Agent.
         agent._register_builtin_tools()
         agent._build_prompt_context()
+        agent._rolling_summary = ""
+        agent._uncompacted_turns = []
         repo = getattr(agent, "chat_repo", None)
         if repo is not None:
             history = repo.load(agent.cfg.short_term_max_turns * 2,
                                 user_id=agent.user_id, conversation_id=conversation_id)
             for item in history:
                 agent.stm.add(item.role, item.content)
+                agent._uncompacted_turns.append({"role": item.role, "content": item.content})
         return agent

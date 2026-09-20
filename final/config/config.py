@@ -63,7 +63,7 @@ _CONFIG_SCHEMA = {
         "rerank",
         "retrieval_circuit",
     },
-    "memory": {"short_term_max_turns", "long_term_top_k", "consolidation"},
+    "memory": {"short_term_max_turns", "long_term_top_k", "consolidation", "compactor"},
     "harness": {"max_retries", "retry_delay_ms", "step_timeout_ms", "max_iterations", "max_llm_calls_per_turn", "max_tool_calls_per_turn"},
     "graph_runtime": {
         "max_parallel",
@@ -117,6 +117,11 @@ _NESTED_CONFIG_SCHEMA = {
         "decay_rate",
         "min_importance",
         "trigger_interval",
+    },
+    ("memory", "compactor"): {
+        "enabled",
+        "max_recent_turns",
+        "char_watermark",
     },
     ("observability", "pprof"): {"enabled", "admin_token"},
 }
@@ -209,6 +214,9 @@ class APIConfig:
         self.memory_consolidation_decay_rate = 0.995
         self.memory_consolidation_min_import = 0.3
         self.memory_consolidation_trigger = 5
+        self.enable_context_compactor = True
+        self.context_compactor_max_recent_turns = 3
+        self.context_compactor_char_watermark = 1500
 
         # ---- Harness ----
         self.max_retries = 3
@@ -426,6 +434,10 @@ def default_config(config_path: Optional[str] = None) -> APIConfig:
         c.memory_consolidation_decay_rate = cons.get("decay_rate", 0.995)
         c.memory_consolidation_min_import = cons.get("min_importance", 0.3)
         c.memory_consolidation_trigger = cons.get("trigger_interval", 5)
+        if comp := memory.get("compactor", {}) or {}:
+            c.enable_context_compactor = bool(comp.get("enabled", True))
+            c.context_compactor_max_recent_turns = int(comp.get("max_recent_turns", 3))
+            c.context_compactor_char_watermark = int(comp.get("char_watermark", 1500))
 
     if harness := data.get("harness"):
         c.max_retries = harness.get("max_retries", 3)
@@ -524,6 +536,19 @@ def _apply_environment_overrides(c: APIConfig) -> None:
                     logger.warning("环境变量 %s 不是合法整数，已忽略: %s", env_k, v)
                     continue
             setattr(c, attr_k, raw)
+
+    if env_comp := os.getenv("AGI_ENABLE_CONTEXT_COMPACTOR"):
+        c.enable_context_compactor = env_comp.strip().lower() in {"1", "true", "yes", "on"}
+    if env_turns := os.getenv("AGI_CONTEXT_COMPACTOR_MAX_RECENT_TURNS"):
+        try:
+            c.context_compactor_max_recent_turns = int(env_turns.strip())
+        except ValueError:
+            pass
+    if env_wm := os.getenv("AGI_CONTEXT_COMPACTOR_CHAR_WATERMARK"):
+        try:
+            c.context_compactor_char_watermark = int(env_wm.strip())
+        except ValueError:
+            pass
 
 
 def _load_dotenv_best_effort() -> None:

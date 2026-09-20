@@ -45,6 +45,7 @@ from internal.promptctx import (
     ToolStateTracker,
     default_schemas,
 )
+from internal.promptctx.compactor import ContextCompactor
 from internal.observability import redact_text, sanitize_trace
 from internal.rag.rag import Engine as RAGEngine
 from internal.rag.reranker import LLMReranker
@@ -248,6 +249,17 @@ class UnifiedAgent:
         self._turn_count = 0
         self._snapshot_every = max(1, getattr(cfg, "snapshot_every_turns", 5) or 5)
         self._build_prompt_context()
+
+        # 自适应上下文压缩器（ContextCompactor，对齐 MemGPT/AutoGen）
+        self._rolling_summary = ""
+        self._uncompacted_turns: List[Dict[str, str]] = []
+        self.compactor = None
+        if getattr(cfg, "enable_context_compactor", True):
+            self.compactor = ContextCompactor(
+                max_recent_turns=getattr(cfg, "context_compactor_max_recent_turns", 3),
+                char_watermark=getattr(cfg, "context_compactor_char_watermark", 1500),
+                summarizer_fn=self._compactor_summary_fn,
+            )
 
         logger.info("✅ UnifiedAgent 初始化完成")
 
@@ -482,7 +494,6 @@ class UnifiedAgent:
         self._document_store_call("delete", document_id)
 
     def ingest_document(self, document_id: str, version_id: str = "") -> Dict[str, Any]:
-        store = self._document_store()
         if version_id:
             ver = self._document_store_call("get_version", version_id)
         else:
@@ -707,6 +718,8 @@ class UnifiedAgent:
         """assistant 写回 + 异步记忆抽取 + 异步图感知合并 + 事件发布 + 计数。"""
         self.stm.add("assistant", resp.answer)
         self._save_chat_history("assistant", resp.answer)
+        if hasattr(self, "_uncompacted_turns") and isinstance(self._uncompacted_turns, list):
+            self._uncompacted_turns.append({"role": "assistant", "content": resp.answer})
 
         # 异步：从回复中提取事实 → 长期记忆
         if getattr(self.cfg, "memory_store_exchange_facts", False):
@@ -887,7 +900,13 @@ class UnifiedAgent:
         return "\n".join(parts)
 
     def _recent_history_for_rag(self) -> List[HistoryMessage]:
-        return [HistoryMessage(role=m["role"], content=m["content"]) for m in self.stm.get()[-6:]]
+        msgs = []
+        rolling_summary = getattr(self, "_rolling_summary", "")
+        if rolling_summary:
+            msgs.append(HistoryMessage(role="system", content=f"【前情提要与历史背景摘要】\n{rolling_summary}"))
+        stm_msgs = [HistoryMessage(role=m["role"], content=m["content"]) for m in self.stm.get()]
+        msgs.extend(stm_msgs[-5:] if rolling_summary else stm_msgs[-6:])
+        return msgs
 
     def _run_rag_query(self, query: str):
         answer, results, _trace = self._run_rag_query_with_trace(query)
@@ -937,10 +956,77 @@ class UnifiedAgent:
             "reason": "legacy_rag_engine",
         }
 
+    def _compactor_summary_fn(self, turns_to_compress: List[Dict[str, str]]) -> str:
+        """为被滑动窗口淘汰的历史对话生成滚动摘要（优先快模型 LLM，离线/测试降级为启发式规则）。"""
+        if not turns_to_compress:
+            return ""
+        if (
+            hasattr(self, "llm")
+            and self.llm is not None
+            and hasattr(self, "cfg")
+            and getattr(self.cfg, "is_real_llm", lambda: False)()
+        ):
+            try:
+                transcript = "\n".join(
+                    f"{t.get('role', 'user')}: {t.get('content', '')}"
+                    for t in turns_to_compress
+                )
+                prompt = [
+                    Message(
+                        role="user",
+                        content=(
+                            "请用简明扼要的一两句话提炼以下多轮对话的关键背景、用户关键偏好与重要决策，"
+                            "作为后续对话的前情提要，不要废话：\n\n" + transcript
+                        ),
+                    )
+                ]
+                summary = self.llm.chat_fast(prompt)
+                if summary and summary.strip():
+                    return summary.strip()
+            except Exception as e:
+                logger.debug("LLM 摘要生成失败，降级为规则提炼: %s", e)
+        return ContextCompactor._default_heuristic_summary(turns_to_compress)
+
     def _build_history_messages(self, query: str) -> List[Message]:
-        msgs = [Message(role=m["role"], content=m["content"]) for m in self.stm.get()]
-        if not msgs or msgs[-1].content != query:
-            msgs.append(Message(role="user", content=query))
+        compactor = getattr(self, "compactor", None)
+        if compactor is None or not getattr(self.cfg, "enable_context_compactor", True):
+            msgs = [Message(role=m["role"], content=m["content"]) for m in self.stm.get()]
+            if not msgs or msgs[-1].content != query:
+                msgs.append(Message(role="user", content=query))
+            return msgs
+
+        # 启用了 ContextCompactor
+        uncompacted = getattr(self, "_uncompacted_turns", None)
+        if uncompacted is None:
+            uncompacted = []
+            self._uncompacted_turns = uncompacted
+
+        # 若本地缓存为空但 stm 中已有对话历史（例如 DB 还原或多会话克隆），从 stm 初始化
+        if not uncompacted and hasattr(self, "stm"):
+            stm_items = self.stm.get()
+            if stm_items:
+                uncompacted.extend(stm_items)
+
+        # 确保当前 query 在消息末尾
+        if not uncompacted or uncompacted[-1].get("content") != query:
+            uncompacted.append({"role": "user", "content": query})
+
+        existing_summary = getattr(self, "_rolling_summary", "")
+        res = compactor.compact(uncompacted, existing_summary=existing_summary)
+
+        if res.compressed_turns_count > 0:
+            self._rolling_summary = res.rolling_summary
+            self._uncompacted_turns = list(res.recent_history)
+        else:
+            self._rolling_summary = res.rolling_summary
+
+        msgs: List[Message] = []
+        if self._rolling_summary:
+            msgs.append(Message(role="system", content=f"【前情提要与历史背景摘要】\n{self._rolling_summary}"))
+
+        for m in res.recent_history:
+            msgs.append(Message(role=m.get("role", "user"), content=m.get("content", "")))
+
         return msgs
 
     def _chat_response(self, mem_prefix: str, hist_msgs: List[Message], token=None, on_event=None) -> str:
