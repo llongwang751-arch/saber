@@ -7,7 +7,7 @@ from datetime import date
 from typing import Any
 
 import bcrypt
-from fastapi import APIRouter, FastAPI, File, HTTPException, Query, Request, UploadFile
+from fastapi import APIRouter, FastAPI, HTTPException, Query, Request
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
@@ -261,6 +261,9 @@ def install_application_features(
     app.state.skill_service = skills
     app.state.agent_registry = registry
     app.state.medical_service = medical
+    # _router() 中的 /api/medical/soap 需要用它落库病历文档；
+    # 该函数是本闭包内的定义，路由层只能经 app.state 访问。
+    app.state.write_medical_document = write_medical_document
     app.state.auth_required = bool(auth_required)
     app.state.development_user = seed_user
     app.state.memory_outbox_worker = outbox_worker
@@ -427,7 +430,7 @@ def _router() -> APIRouter:
             return _auth_error_response(
                 request, status_code=400, code="invalid_input", error=str(exc)
             )
-        except AuthenticationError as exc:
+        except AuthenticationError:
             return _auth_error_response(
                 request,
                 status_code=401,
@@ -607,7 +610,7 @@ def _router() -> APIRouter:
         )
         doc_id = None
         if body.save_document:
-            doc_id = write_medical_document(
+            doc_id = request.app.state.write_medical_document(
                 user["id"],
                 title=f"门诊病历-{body.patient_info.get('name', '就诊记录')}-{date.today().isoformat()}",
                 markdown=soap_md,

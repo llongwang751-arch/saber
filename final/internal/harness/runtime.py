@@ -20,7 +20,7 @@ from internal.harness.events import (
     MemoryEventStream,
     SqliteEventStream,
 )
-from internal.harness.loops import BaseLoopPlugin, DirectChatLoopPlugin, ReActLoopPlugin
+from internal.harness.loops import BaseLoopPlugin, ReActLoopPlugin
 from internal.harness.plugins import (
     AuditLogPlugin,
     DependencyFallbackPlugin,

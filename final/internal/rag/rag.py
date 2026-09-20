@@ -8,9 +8,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from config.config import APIConfig
 from internal.graph.kgstore import KGStore
-from internal.graph.types import ChunkRef
 from internal.harness.guardrails import find_injection
-from internal.infra.infra import Infrastructure, RAG_COLLECTION
+from internal.infra.infra import Infrastructure
 from internal.llm.llm import Client as LLMClient
 from internal.rag.hybrid import HybridStore
 from internal.rag.rewriter import HistoryMessage

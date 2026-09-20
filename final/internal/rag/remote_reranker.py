@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import logging
-import math
 from typing import List, Optional
 import requests
 
-from internal.rag.local_reranker import LocalOverlapReranker, _content, _finite_score
+from internal.rag.local_reranker import LocalOverlapReranker, _content
 
 logger = logging.getLogger(__name__)
 

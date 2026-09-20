@@ -1,7 +1,7 @@
 import json
 from types import SimpleNamespace
 
-from internal.rag.hybrid import HybridResult, HybridStore
+from internal.rag.hybrid import HybridStore
 from internal.rag.rag import Engine
 from internal.rag.reranker import LLMReranker
 from internal.rag.rewriter import HistoryMessage, LLMRewriter

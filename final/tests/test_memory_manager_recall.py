@@ -1,9 +1,8 @@
 """MemoryManager.recall 单元测试（Task 15：单方法 LTM → graph 1-hop 扩展）。"""
 import time
 from types import SimpleNamespace
-from typing import List
 
-from internal.memory.memory import Item, LongTerm, MemoryManager
+from internal.memory.memory import Item, MemoryManager
 
 
 class _LtmRepo:

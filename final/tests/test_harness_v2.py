@@ -1,4 +1,3 @@
-import pytest
 from internal.graph.task_graph import Node, TaskGraph
 from internal.harness import (
     DAGLoopPlugin,
@@ -6,8 +5,6 @@ from internal.harness import (
     EventType,
     HarnessRuntime,
     MemoryEventStream,
-    ReActLoopPlugin,
-    ResiliencePlugin,
     SqliteEventStream,
 )
 

@@ -3,7 +3,6 @@ import json
 import inspect
 import logging
 import math
-import re
 import threading
 import time
 from collections import Counter, deque
@@ -1232,7 +1231,6 @@ class LongTerm:
         with self._lock:
             self._last_consolidate_ts = time.time()
             self._items_since_last = 0
-        reasons = {entry.reason for entry in plan.deletes}
         result = ConsolidationResult(
             deduped=sum(entry.reason == "deduplicated" for entry in plan.deletes),
             merged=sum(entry.reason == "merged" for entry in plan.deletes),

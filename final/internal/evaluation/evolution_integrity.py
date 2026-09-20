@@ -9,23 +9,20 @@
 from __future__ import annotations
 
 import hashlib
-from typing import Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+
+if TYPE_CHECKING:
+    # 仅注解使用；运行时经函数内惰性导入（见各函数体）。
+    from .store import EvolutionSuggestionRecord, StrategyVersionRecord
 
 def verify_evolution_record(
     session: Session, record: EvolutionSuggestionRecord
 ) -> None:
     from .store import (  # 惰性导入：避免与 store.py 的顶层循环依赖
-        _EVOLUTION_AUDIT_GENESIS,
-        EvolutionAuditEventRecord,
-        EvolutionSuggestionRecord,
         ImmutableEvolutionSuggestionError,
-        StrategyVersionRecord,
-        _empty_evolution_state,
-        _evolution_event_checksum,
-        _evolution_state_snapshot,
         _jsonable,
     )
     from .evolution import (
@@ -61,14 +58,8 @@ def verify_source_strategy_evidence(
     """Bind the source strategy row to the immutable evidence envelope."""
 
     from .store import (  # 惰性导入：避免与 store.py 的顶层循环依赖
-        _EVOLUTION_AUDIT_GENESIS,
-        EvolutionAuditEventRecord,
-        EvolutionSuggestionRecord,
         ImmutableEvolutionSuggestionError,
         StrategyVersionRecord,
-        _empty_evolution_state,
-        _evolution_event_checksum,
-        _evolution_state_snapshot,
         _jsonable,
     )
     from .evolution import canonical_checksum
@@ -124,7 +115,6 @@ def verify_evolution_audit_chain(
     from .store import (  # 惰性导入：避免与 store.py 的顶层循环依赖
         _EVOLUTION_AUDIT_GENESIS,
         EvolutionAuditEventRecord,
-        EvolutionSuggestionRecord,
         ImmutableEvolutionSuggestionError,
         StrategyVersionRecord,
         _empty_evolution_state,
@@ -363,7 +353,6 @@ def verify_materialized_strategy(
     from .store import (  # 惰性导入：避免与 store.py 的顶层循环依赖
         ImmutableEvolutionSuggestionError,
         STRATEGY_SOURCE,
-        StrategyVersionRecord,
     )
     from .strategy import canonical_manifest_json
 

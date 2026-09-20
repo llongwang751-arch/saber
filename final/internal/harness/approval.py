@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import logging
 import time
-import uuid
 import hashlib
 import json
 import threading

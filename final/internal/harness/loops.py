@@ -9,10 +9,9 @@ from __future__ import annotations
 
 import json
 import logging
-import time
 from typing import Any, Callable, Dict, List, Optional
 
-from internal.graph.task_graph import Node, NodeStatus, TaskGraph
+from internal.graph.task_graph import NodeStatus, TaskGraph
 from internal.harness.events import EventType
 from internal.harness.plugins import HarnessContext, HarnessPlugin
 

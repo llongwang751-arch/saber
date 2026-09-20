@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 from internal.harness.events import EventType
 from internal.harness.plugins import HarnessContext, HarnessPlugin

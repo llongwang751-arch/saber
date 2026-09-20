@@ -16,7 +16,6 @@ import time
 from types import SimpleNamespace
 from unittest import mock
 
-import pytest
 
 from internal.agent import agent as agent_mod
 

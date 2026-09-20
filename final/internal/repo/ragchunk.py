@@ -517,9 +517,11 @@ class Store:
                    user_id: str = DEFAULT_USER_ID) -> Tuple[List[int], Optional[Exception]]:
         if not self._pg_real():
             return [], RuntimeError("postgres not connected")
+        # 单条 DELETE ... RETURNING：先前"先 SELECT 再 DELETE"的两步在
+        # autocommit 连接上存在 TOCTOU——并发写入会漏删或返回已被删除的 id。
         try:
             rows = self.pg.query(
-                "SELECT id FROM rag_chunks WHERE user_id = %s AND doc_hash = %s",
+                "DELETE FROM rag_chunks WHERE user_id = %s AND doc_hash = %s RETURNING id",
                 (user_id, doc_hash),
             )
         except Exception as e:
@@ -530,15 +532,6 @@ class Store:
                 ids.append(int(r[0]))
             except Exception:
                 continue
-        if not ids:
-            return [], None
-        try:
-            self.pg.exec(
-                "DELETE FROM rag_chunks WHERE user_id = %s AND doc_hash = %s",
-                (user_id, doc_hash),
-            )
-        except Exception as e:
-            return ids, e
         return ids, None
 
     def _delete_es(self, pg_ids: List[int]) -> None:

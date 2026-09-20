@@ -15,19 +15,13 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
-from datetime import date, datetime
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
+from datetime import date
+from typing import Any, Dict, List, Mapping
 
 from internal.tools.tools import Tool
 
 from .medical import (
     MedicalService,
-    check_emergency_redline,
-    check_drug_safety,
-    calculate_bmi,
-    calculate_gfr,
-    calculate_cha2ds2_vasc,
-    generate_soap_note,
 )
 
 logger = logging.getLogger(__name__)

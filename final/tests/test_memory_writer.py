@@ -7,7 +7,7 @@
 - extract_memory_from_reply：偏好写入 + classify → store_classified → sync_last_item_pg_id
 """
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, List, Tuple
 
 from internal.agent.memory_writer import (
     classify_memory_content,

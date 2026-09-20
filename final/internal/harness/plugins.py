@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from internal.harness.events import BaseEventStream, EventType, HarnessEvent
 from internal.resilience.circuit_breaker import CircuitBreaker

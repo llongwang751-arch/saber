@@ -13,7 +13,6 @@
 #
 # 所有恢复动作做异常吞没（best-effort），任意一项失败不阻塞 agent 启动。
 import logging
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 

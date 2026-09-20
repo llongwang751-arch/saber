@@ -24,7 +24,6 @@ from internal.application.medical import (
     MedicalService,
 )
 from internal.application.medical_agent import (
-    MEDICAL_TOOL_NAME,
     build_medical_copilot_tool,
     is_medical_query,
     parse_medical_request,

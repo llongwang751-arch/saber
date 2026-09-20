@@ -6,7 +6,6 @@
 """
 import threading
 import time
-from types import SimpleNamespace
 from typing import List
 
 from internal.memory.graph_memory import GraphMemory

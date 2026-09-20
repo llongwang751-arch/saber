@@ -24,7 +24,6 @@ from internal.memory.consistency import (
     ConsolidationPlan,
     EventType,
     MemoryCommitError,
-    MemoryDelete,
     MemoryRecord,
     MemoryUpdate,
     OutboxEvent,

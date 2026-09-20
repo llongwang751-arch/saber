@@ -14,7 +14,6 @@ from internal.memory.consistency import (
     MemoryRecord,
     ProjectionConflict,
     ProjectionState,
-    Target,
     compute_content_hash,
     milvus_projector,
 )

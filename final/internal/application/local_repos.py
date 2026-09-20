@@ -16,7 +16,7 @@ import threading
 import time
 import uuid
 from collections import Counter
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from typing import Any
 
 from sqlalchemy import delete, func, select, text

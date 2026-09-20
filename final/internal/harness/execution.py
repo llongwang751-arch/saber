@@ -43,7 +43,7 @@ def start_session(ctx):
     for plugin in ctx.plugins:
         try:
             plugin.on_session_start(ctx)
-        except Exception as exc:
+        except Exception:
             ctx.interrupted = True
             ctx.interrupted_reason = f"Session policy failed: {plugin.name}"
             ctx.emit(EventType.ERROR, {"error": ctx.interrupted_reason})

@@ -1,5 +1,3 @@
-import pytest
-import numpy as np
 from internal.memory.slot_extractor import SlotExtractor
 from internal.memory.fast_vector_index import FastVectorIndex
 

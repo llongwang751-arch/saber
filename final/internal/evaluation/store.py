@@ -2598,9 +2598,7 @@ def _evolution_audit_dict(record: EvolutionAuditEventRecord) -> dict[str, Any]:
 
 
 from .evolution_integrity import (
-    verify_evolution_audit_chain as _verify_evolution_audit_chain,
     verify_evolution_record as _verify_evolution_record,
-    verify_source_strategy_evidence as _verify_source_strategy_evidence,
 )
 
 def _empty_evolution_state() -> dict[str, Any]:

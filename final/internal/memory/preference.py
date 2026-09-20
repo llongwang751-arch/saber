@@ -6,7 +6,7 @@
 #   - ExtractAndSave 规则、BuildContext 输出格式、对外方法签名严格对齐。
 import logging
 import threading
-from typing import Dict, Optional, Tuple
+from typing import Dict, Tuple
 
 from internal.infra.infra import Infrastructure
 

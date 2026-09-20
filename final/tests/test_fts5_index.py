@@ -1,6 +1,5 @@
 import sqlite3
-import pytest
-from internal.rag.fts5_index import FTS5IndexManager, fts_tokenize, build_fts_query
+from internal.rag.fts5_index import FTS5IndexManager, fts_tokenize
 
 
 def test_fts_tokenize():

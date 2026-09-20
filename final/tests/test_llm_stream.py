@@ -11,7 +11,6 @@ import time
 from types import SimpleNamespace
 from typing import List
 
-import pytest
 
 from internal.llm.llm import Client, Message
 

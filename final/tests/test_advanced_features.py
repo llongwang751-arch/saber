@@ -1,4 +1,3 @@
-import pytest
 
 from internal.harness.approval import ApprovalStatus, HumanInTheLoopPlugin
 from internal.harness.guardrails import SecurityGuardrailPlugin, sanitize_pii
@@ -6,7 +5,6 @@ from internal.harness.runtime import HarnessRuntime
 from internal.memory.conflict_resolver import (
     MemoryAction,
     MemoryConflictResolver,
-    VersionedMemoryFact,
 )
 from internal.promptctx.compactor import ContextCompactor
 from internal.rag.parent_child_splitter import ParentChildSplitter

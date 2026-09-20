@@ -128,6 +128,12 @@ python main.py
 
 `AGI_AUTH_REQUIRED` 默认为 `1`。本地模式首次打开页面可注册账号；后续用同一账号登录。文档、记忆、医疗业务数据和技能按账号隔离，评测证据按租户共享并由角色控制，便于创建者与另一名审批人在同一证据上完成双人审核。切换到 `production_authenticated` 后公开注册会自动关闭，必须使用后台预置命令创建业务账号。未设置安全 JWT 密钥时 `/api/status` 会暴露开发密钥告警，不能用于生产环境。
 
+其它常用环境变量：
+
+- `AGI_PG_PASSWORD` / `AGI_NEO4J_PASSWORD` / `AGI_MINIO_USER` / `AGI_MINIO_PASSWORD` — docker compose 启动基础设施时**必填**（compose 通过 `.env` 自动读取），本地直连时 config.yaml 通过 `${VAR}` 插值使用同名变量。
+- `AGI_UPLOAD_MAX_BYTES` — 单次上传大小上限（默认 25MB）。上传仅接受 md/markdown/txt/pdf 扩展名，超限返回 413。
+- `AGI_LLM_ALLOW_MOCK` — 模型**未配置**时默认可用 Mock 回复（开发 profile）；设为 `0` 全局禁止。已配置真实模型但调用失败时，只有显式设置 `AGI_LLM_ALLOW_MOCK=1` 才回退 Mock，否则报错——生产环境不会静默收到模拟回复。
+
 获取 Key：
 - 火山方舟控制台：https://console.volcengine.com/ark
 - 创建一个有 `Chat Completions` + `Embedding` 权限的 API Key
