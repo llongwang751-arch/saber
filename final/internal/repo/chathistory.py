@@ -1,7 +1,7 @@
 # chathistory — 聊天记录仓储（Postgres 实现）。
 # 写入 chat_history (role, content, created_at)。
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List
 
 from internal.platform.postgres import PostgresClient
