@@ -9,7 +9,6 @@ from .types import (
     RISK_SAFE,
     SandboxConfig,
     SecurityConfig,
-    ValidationResult,
 )
 from .validator import Validator
 
