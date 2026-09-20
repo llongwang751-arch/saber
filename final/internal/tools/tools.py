@@ -15,10 +15,12 @@ import os
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import requests
+
+from .mcp_client import McpProtocolError, call_remote_tool
 
 logger = logging.getLogger(__name__)
 
@@ -564,6 +566,87 @@ def decide(query: str, ts: Dict[str, Tool]) -> Optional[CallResult]:
 
 
 # ─────────────────────────────── MCP 工具 ────────────────────────────────────
+
+def build_mcp_remote_tool(endpoint: str, spec: Dict[str, Any]) -> Tool:
+    """把 MCP tools/list 返回的工具规格包装成本地标准 Tool。
+
+    - 本地名加 mcp_ 前缀（防与内置工具撞名）；参数表从 inputSchema(JSON
+      Schema) 提取 name/type/description/required。
+    - 执行统一走 tools/call。错误语义映射：协议错误与远端业务错误（isError）
+      不可重试；超时/网络/HTTP 5xx 可重试——与 new_mcp_tool 的分类一致。
+    - side_effecting=True：外部能力默认按写操作对待，走统一的审批/护栏链。
+    """
+    remote_name = str(spec.get("name") or "")
+    local_name = f"mcp_{remote_name}"
+    description = str(spec.get("description") or f"MCP 远端工具 {remote_name}")
+    schema = spec.get("inputSchema") if isinstance(spec.get("inputSchema"), dict) else {}
+    properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+    required = set(schema.get("required") or []) if isinstance(schema.get("required"), list) else set()
+    params: List[Dict[str, str]] = []
+    for pname, pdef in properties.items():
+        pdef = pdef if isinstance(pdef, dict) else {}
+        params.append({
+            "name": str(pname),
+            "type": str(pdef.get("type") or "string"),
+            "description": str(pdef.get("description") or ""),
+            "required": "true" if str(pname) in required else "",
+        })
+
+    def _invoke(p: Dict[str, Any], ctx: Optional[ToolCallContext]) -> Tuple[str, bool]:
+        if ctx is not None and ctx.deadline is not None:
+            timeout = ctx.remaining_seconds(MCP_DEFAULT_TIMEOUT_SECONDS)
+        else:
+            timeout = float(MCP_DEFAULT_TIMEOUT_SECONDS)
+        return call_remote_tool(endpoint, remote_name, p, timeout)
+
+    def _execute_ctx(ctx: ToolCallContext, p: Dict[str, Any]) -> str:
+        try:
+            text, is_error = _invoke(p, ctx)
+        except McpProtocolError as exc:
+            raise ToolError(
+                "remote" if not exc.retryable else "timeout",
+                str(exc), retryable=exc.retryable, cause=exc,
+            ) from exc
+        if is_error:
+            raise ToolError("remote", text or "MCP 工具返回错误", retryable=False)
+        return text
+
+    def _structured(ctx: ToolCallContext, p: Dict[str, Any]) -> ToolResult:
+        started = time.perf_counter()
+        metadata = {"backend": "mcp", "endpoint": endpoint, "remote": remote_name}
+        try:
+            text, is_error = _invoke(p, ctx)
+        except McpProtocolError as exc:
+            return ToolResult(
+                success=False,
+                error=ToolError(
+                    "remote" if not exc.retryable else "timeout",
+                    str(exc), retryable=exc.retryable, cause=exc,
+                ),
+                duration=time.perf_counter() - started,
+                metadata=metadata,
+            )
+        if is_error:
+            return ToolResult(
+                success=False,
+                error=ToolError("remote", text or "MCP 工具返回错误", retryable=False),
+                duration=time.perf_counter() - started,
+                metadata=metadata,
+            )
+        return ToolResult(
+            success=True, payload=text,
+            duration=time.perf_counter() - started, metadata=metadata,
+        )
+
+    def _func(p: Dict[str, Any]) -> str:
+        return _execute_ctx(ToolCallContext(), p)
+
+    return Tool(
+        name=local_name, description=description, params=params, func=_func,
+        is_mcp=True, execute_ctx=_execute_ctx, execute_structured=_structured,
+        side_effecting=True,
+    )
+
 
 def new_mcp_tool(
     name: str,

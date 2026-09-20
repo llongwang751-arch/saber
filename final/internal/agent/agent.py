@@ -13,6 +13,7 @@
 import json
 import inspect
 import logging
+import os
 import threading
 import time
 import uuid
@@ -64,7 +65,12 @@ from .memory_writer import (
     maybe_consolidate_memory,
 )
 from .restore import init_knowledge_graph, restore_from_db, restore_rag_from_db
-from .planner import llm_plan_graph, needs_subagent_plan, subagent_pipeline_nodes
+from .planner import (
+    llm_plan_graph,
+    needs_subagent_plan,
+    refine_intent_with_llm,
+    subagent_pipeline_nodes,
+)
 from .status import infra_status, status as build_status
 from .subagents import register_builtin_subagents
 
@@ -531,6 +537,36 @@ class UnifiedAgent:
     ):
         self.add_tool(new_mcp_tool(name, description, params, func=func, endpoint=endpoint))
 
+    def register_mcp_server(self, endpoint: str) -> Dict[str, Any]:
+        """按 MCP 协议握手并批量注册远端服务器提供的工具。
+
+        与 register_mcp_tool 的单工具裸 HTTP 模式互补：这里完成 initialize
+        握手与 tools/list 自动发现，远端每个工具以 mcp_ 前缀注册为本地 Tool，
+        执行走 tools/call。与既有工具重名的一律跳过（不静默覆盖内置能力）。
+        SSRF 校验沿用 validate_mcp_endpoint：默认拒绝内网/回环端点。
+        """
+        from internal.tools.mcp_client import initialize_session, list_remote_tools
+        from internal.tools.tools import build_mcp_remote_tool, validate_mcp_endpoint
+
+        validate_mcp_endpoint(endpoint)
+        server_info = initialize_session(endpoint)
+        specs = list_remote_tools(endpoint)
+        existing = set(self.tool_executor.snapshot().keys())
+        registered: List[str] = []
+        skipped: List[str] = []
+        for spec in specs:
+            remote_name = str(spec.get("name") or "").strip()
+            if not remote_name:
+                continue
+            local_name = f"mcp_{remote_name}"
+            if local_name in existing:
+                skipped.append(local_name)
+                continue
+            self.add_tool(build_mcp_remote_tool(endpoint, spec))
+            existing.add(local_name)
+            registered.append(local_name)
+        return {"server": server_info, "registered": registered, "skipped": skipped}
+
     def rag_ingest(self, document: str) -> int:
         if self.rag is None:
             return 0
@@ -659,6 +695,8 @@ class UnifiedAgent:
         if opts.use_rag and rag_loaded:
             if self._report_intent(query):
                 return "rag_agent", None
+            if self._report_intent_refined(query):
+                return "rag_agent", None
             return "rag", None
         executor = getattr(self, "tool_executor", None)
         return "react", executor.snapshot() if executor is not None else {}
@@ -666,6 +704,21 @@ class UnifiedAgent:
     @staticmethod
     def _report_intent(query: str) -> bool:
         return needs_subagent_plan(query)
+
+    def _report_intent_refined(self, query: str) -> bool:
+        """可选的 LLM 意图复核（默认关闭）：兜住关键词漏网的报告类任务。
+
+        两级漏斗的第二级——关键词命中时 `_route_decide` 已短路返回，只有
+        未命中的灰区消息才会走到这里。开关关闭、复核超时或输出非法时一律
+        维持关键词结果（rag），路由行为与未启用时完全一致。
+        """
+        raw = os.getenv("AGI_INTENT_LLM_ENABLED", "").strip().lower()
+        if raw not in {"1", "true", "yes", "on"}:
+            return False
+        try:
+            return refine_intent_with_llm(self, query)
+        except Exception:
+            return False
 
     # ── dispatch ─────────────────────────────────────────────────────────────
 

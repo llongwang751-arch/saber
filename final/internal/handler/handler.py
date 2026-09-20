@@ -70,6 +70,10 @@ class MCPRegisterRequest(BaseModel):
     params: List[Dict[str, Any]] = Field(default_factory=list)
 
 
+class MCPServerDiscoverRequest(BaseModel):
+    endpoint: str = Field(..., min_length=1, description="MCP 服务器 Streamable HTTP 端点")
+
+
 class DocsDeleteRequest(BaseModel):
     doc_hash: str = Field(..., min_length=1)
 
@@ -1275,6 +1279,32 @@ def setup_routes(
             raise HTTPException(status_code=400, detail=str(e))
         except Exception as e:
             logger.error("注册 MCP 工具失败: %s", e)
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post("/api/tools/mcp/discover")
+    async def discover_mcp_server(req: MCPServerDiscoverRequest, request: Request):
+        """握手并发现 MCP 服务器的工具清单，批量注册进当前用户的工具箱。
+
+        与 /api/tools/mcp 的单工具裸 HTTP 注册互补：本端点走 MCP 协议
+        （initialize → tools/list），远端工具以 mcp_ 前缀注册，执行走 tools/call。
+        """
+        from internal.tools.mcp_client import McpProtocolError
+
+        try:
+            active_agent = current_agent(request)
+            endpoint = req.endpoint.strip()
+            if not endpoint:
+                raise HTTPException(status_code=400, detail="缺少 endpoint 参数")
+            return await run_in_threadpool(active_agent.register_mcp_server, endpoint)
+        except HTTPException:
+            raise
+        except ValueError as e:
+            # SSRF 校验失败等注册期校验错误。
+            raise HTTPException(status_code=400, detail=str(e))
+        except McpProtocolError as e:
+            raise HTTPException(status_code=502, detail=str(e))
+        except Exception as e:
+            logger.error("发现 MCP 服务器失败: %s", e)
             raise HTTPException(status_code=500, detail=str(e))
 
     @app.get("/api/status")

@@ -5,7 +5,9 @@
 # LLM 不可用或解析失败时降级到 rule_plan_items 关键字规则。
 import json
 import logging
+import os
 import re
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
@@ -336,6 +338,82 @@ def needs_subagent_plan(query: str) -> bool:
         keyword in value
         for keyword in ("研究", "调研", "总结", "报告", "文档", "方案", "分析")
     )
+
+
+# 可选的 LLM 意图复核：只兜关键词漏网的灰区消息，默认由调用方开关控制。
+# 超时/异常/非法输出一律回退"非报告"，路由永远保留确定性 fallback。
+_INTENT_LLM_TIMEOUT_SECONDS = 3.0
+_INTENT_LLM_MIN_QUERY_CHARS = int(os.getenv("AGI_INTENT_LLM_MIN_CHARS", "12") or 12)
+
+
+def _run_with_timeout(fn, timeout_seconds: float):
+    """daemon 线程执行一次 fn，超时抛 TimeoutError（与 graph_runtime._call_with_timeout 同模式）。"""
+    box: Dict[str, Any] = {}
+
+    def runner():
+        try:
+            box["value"] = fn()
+        except Exception as exc:  # noqa: BLE001 - 异常原样转交主线程
+            box["error"] = exc
+
+    thread = threading.Thread(target=runner, name="intent-llm-refine", daemon=True)
+    thread.start()
+    thread.join(timeout_seconds)
+    if thread.is_alive():
+        raise TimeoutError(f"intent refine exceeded {timeout_seconds}s")
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
+
+
+def refine_intent_with_llm(agent, query: str) -> bool:
+    """用快模型复核关键词未命中的消息是否需要报告类交付物。
+
+    两级漏斗的第二级：`needs_subagent_plan` 关键词命中时调用方直接短路，
+    不会走到这里；本函数只为"像报告但没命中关键词"的灰区消息兜底。
+    任何失败（无 LLM / 超时 / 异常 / 非 JSON 输出 / 过短消息）都返回 False，
+    调用方据此维持关键词结果（rag），不影响主链路可用性。
+    """
+    llm = getattr(agent, "llm", None)
+    chat_fast = getattr(llm, "chat_fast", None) if llm is not None else None
+    text = str(query or "").strip()
+    if chat_fast is None or not text:
+        return False
+    if len(text) < _INTENT_LLM_MIN_QUERY_CHARS:
+        return False
+
+    prompt = (
+        "判断下面这条用户消息是否需要产出研究/报告类交付物"
+        "（需要多步检索、整理并写成文档的任务）。\n"
+        '只输出 JSON：{"needs_report": true} 或 {"needs_report": false}，'
+        "不要输出其他内容。\n\n"
+        f"用户消息：{text}"
+    )
+
+    def _ask() -> str:
+        return chat_fast(
+            [Message(role="user", content=prompt)],
+            system_prompt="你是意图分类器，只输出指定格式的 JSON。",
+        )
+
+    try:
+        raw = str(_run_with_timeout(_ask, _INTENT_LLM_TIMEOUT_SECONDS) or "").strip()
+    except Exception as exc:
+        logger.debug("意图复核失败，按非报告处理: %s", exc)
+        return False
+
+    for prefix in ("```json", "```"):
+        if raw.startswith(prefix):
+            raw = raw[len(prefix):].strip()
+    if raw.endswith("```"):
+        raw = raw[:-3].strip()
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return False
+    if isinstance(parsed, dict):
+        return parsed.get("needs_report") is True
+    return False
 
 
 def wants_document_write(query: str) -> bool:
