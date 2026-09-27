@@ -29,6 +29,11 @@ openpyxl>=3.1,<4
 # 但测试无条件依赖它，因此作为正式依赖声明。
 numpy>=1.26
 
+# LangGraph 研究编排后端（research.engine: langgraph；StateGraph/interrupt/Send，
+# checkpoint 用 SqliteSaver 需要 langgraph-checkpoint-sqlite，langchain-core 为其传递依赖）
+langgraph>=1.2,<2
+langgraph-checkpoint-sqlite>=3.1,<4
+
 # 测试依赖（仓库测试可离线运行：python -m pytest -q）
 pytest>=8
 pytest-asyncio>=0.23

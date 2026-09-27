@@ -270,12 +270,7 @@ class NativeRunService:
                     self.append_event(run_id, owner_id, str(event["type"]), event.get("data") or {})
 
             if run["kind"] == "research":
-                if self._research_engine_factory is not None:
-                    engine = self._research_engine_factory(agent)
-                else:
-                    from internal.research import ResearchEngine
-
-                    engine = ResearchEngine.from_agent(agent)
+                engine = self._research_engine(agent, run)
                 if run.get("plan_status") != "approved":
                     plan = engine.plan(
                         run["message"], use_rag=run["use_rag"], cancel_token=token, on_event=on_event,
@@ -351,6 +346,22 @@ class NativeRunService:
                 if self._tokens.get(run_id) is token:
                     self._tokens.pop(run_id, None)
                     self._futures.pop(run_id, None)
+
+    def _research_engine(self, agent, run):
+        """Dispatch research execution by ``research.engine``; native stays the default."""
+        engine_name = str(getattr(getattr(agent, "cfg", None), "research_engine", "") or "native")
+        if engine_name == "langgraph" and self._research_engine_factory is None:
+            from internal.research_graph import LangGraphResearchEngine
+
+            return LangGraphResearchEngine.from_agent(
+                agent, run_id=run["run_id"], conversation_id=run["conversation_id"],
+                parent_run_id=run.get("parent_run_id") or "",
+            )
+        if self._research_engine_factory is not None:
+            return self._research_engine_factory(agent)
+        from internal.research import ResearchEngine
+
+        return ResearchEngine.from_agent(agent)
 
     def append_event(self, run_id, owner_id, event_type, data):
         event_id = self._repository.append_event(

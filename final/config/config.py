@@ -32,7 +32,7 @@ def _project_root() -> str:
 
 _CONFIG_SCHEMA = {
     "features": set(),
-    "research": set(research_config.LIMITS),
+    "research": set(research_config.LIMITS) | {"engine"},
     "tools": {"manifest"},
     "llm": {"api_url", "api_key", "model", "fast_model", "temperature"},
     "embedding": {

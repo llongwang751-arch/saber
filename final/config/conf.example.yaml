@@ -12,6 +12,7 @@ rag:
   profile: local  # SQLite keyword retrieval; no embedding service required
   top_k: 5
 research:
+  engine: native  # research orchestration backend: native (built-in loop) or langgraph (StateGraph + interrupt/Send)
   max_rounds: 3
   max_llm_calls: 16
   max_tool_calls: 20

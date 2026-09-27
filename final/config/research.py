@@ -13,10 +13,13 @@ LIMITS = {
     "timeout_seconds": (300, 1, 3600),
 }
 
+ENGINES = ("native", "langgraph")
+
 
 def initialize(cfg):
     for key, (default, _, _) in LIMITS.items():
         setattr(cfg, f"research_{key}", default)
+    cfg.research_engine = "native"
     cfg.tools_manifest = ""
 
 
@@ -27,6 +30,10 @@ def configure(cfg, data):
         if isinstance(raw, bool) or not str(raw).isdigit() or not low <= int(raw) <= high:
             raise ValueError(f"research.{key} must be an integer between {low} and {high}")
         setattr(cfg, f"research_{key}", int(raw))
+    engine = os.getenv("AGI_RESEARCH_ENGINE", research.get("engine", "native"))
+    if not isinstance(engine, str) or engine not in ENGINES:
+        raise ValueError("research.engine must be one of: " + ", ".join(ENGINES))
+    cfg.research_engine = engine
     cfg.tools_manifest = os.getenv("AGI_TOOLS_MANIFEST", (data.get("tools") or {}).get("manifest", ""))
     if not isinstance(cfg.tools_manifest, str):
         raise ValueError("tools.manifest must be a path string")
