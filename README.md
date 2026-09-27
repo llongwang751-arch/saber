@@ -1,419 +1,156 @@
+# AGI-Saber Research
 
-# AGI-assistant：多模态智能体系统
+**生产级深度研究（Deep Research）框架**：AI 先产出结构化研究计划，人工审批修订后执行——多轮检索、来源去重登记、沙箱代码分析，最终生成**每个结论都带编号引用**的研究报告。全流程持久化：断线重连、崩溃恢复、已验证步骤不重跑。
 
-> Python 版现已加入 **AGI-Saber Research**：计划审核 → 迭代研究 → 引用报告，保留原生持久化运行时与 Vue 3。先看 [研究快速开始](final/docs/research-quickstart.md)；[架构与迁移边界](final/docs/research-architecture.md) 说明新旧链路如何共存。
-
-AGI-assistant 是一个面向个人与企业的多模态智能体系统，融合了检索增强生成（RAG）、三层记忆、知识图谱、沙箱执行与可恢复执行流，支持多轮对话、知识检索、工具调用与复杂推理。系统具备高可用性、可扩展性与工程落地能力。
-
-> 当前分支是 Python/FastAPI 实现，运行目录为 `final/`。快速启动见 [final/README.md](./final/README.md)，架构见 [系统架构与核心流程图](./final/docs/系统架构与核心流程图.md)，完整截图手册见 [全功能跑通与面试演示指南](./final/docs/全功能跑通与面试演示指南.md)，岗位讲解见 [腾讯医疗 AI Agent 质量评测面试准备](./final/docs/腾讯医疗AI-Agent质量评测面试准备.md)。Go 原版仍保留在 `main` 分支，二者互不覆盖。
-
-## 项目特性
-
-- **多阶段智能体核心**：支持纯对话、RAG 检索、单工具调用、多工具编排（ReAct）等多种智能体模式，自动路由。
-- **RAG 检索增强生成**：融合 Milvus 语义向量、Elasticsearch 关键词、Neo4j 知识图谱，三路 RRF 融合排序，自动降级，支持文档分块与异步实体关系抽取。
-- **三层记忆系统**：短期记忆（滑动窗口）、长期记忆（Embedding/TF）、用户偏好（LLM+规则），支持去重、合并、衰减、过期淘汰。
-- **图增强记忆**：长期记忆叠加 Neo4j 图层，支持 FOLLOWS、SIMILAR_TO、CAUSES、BELONGS_TO 等关系，提升历史联想与推理能力。
-- **工具链与可恢复执行**：内置时间、天气、搜索、RAG 检索、命令执行等工具，支持 ReAct 规划-执行-生成流程，任务快照与重试机制保障稳定性。
-- **沙箱执行**：支持 Docker / Local / Mock 三种沙箱后端，资源限制（CPU/内存/PID/网络），命令白名单安全校验。
-- **质量评测闭环**：不可变数据集、Replay/Local/HTTP Adapter、10 项确定性指标、安全硬门禁、Trace、Badcase、回归对比与报告导出。
-- **多用户业务工作台**：JWT 登录与租户隔离，Vue 3 界面集成知识库、Skill 广场、记忆治理和 Agent 评测。
-- **双层持久化**：纯本地 SQLite 可保存文档、RAG、记忆、技能和评测数据；PostgreSQL、Milvus、ES、Neo4j、Kafka 可选增强。
+> 工作流形态（计划 → 人类审核 → 迭代研究 → 引用报告）对标 [ByteDance DeerFlow](https://github.com/bytedance/deer-flow)，运行时为完全自研的原生实现，不是 DeerFlow 的发行版或衍生版。
 
 ---
 
+## 核心特性
 
-## 整体架构图
+### 研究工作流
+
+- **计划级人工审批**：`plan_created` 后运行暂停在 `AWAITING_PLAN_REVIEW`，支持按步骤编辑（目标/指引/依赖/验收条件，CAS 版本冲突检测）、批准、拒绝；断线重连后仍是待审批态
+- **迭代研究循环**：搜索 → 阅读 → 缺口分析 → 再搜索，来源统一登记（URL + 语义指纹两级去重），轮数/token/来源数/时长全部有预算上限
+- **沙箱 Coder**：数据分析代码只交给 Docker 隔离容器（`python:3.11-slim`，网络/只读根/内存/PID 受限）；无沙箱时优雅降级为"仅生成代码"并明示
+- **引用可溯报告**：分节流式写作，结论插入 `[n]` 编号引用，逐字摘录校验；证据不足时如实返回 `partial` 并标注缺口，无来源则失败——不伪造证据
+
+### 生产级运行时（与同类框架的差异化）
+
+- **持久化运行台账**：每个 run / worker / 事件落 SQLite，worker 心跳 + 任务租约（TTL）+ 围栏令牌，杜绝双接管与僵尸写入
+- **动作日志重放恢复**：崩溃后只重放确定成功的步骤，副作用不确定的动作禁止自动重放
+- **SSE 断线重放**：`Last-Event-ID` 游标 + 事件表回放，浏览器断网/重启后从断点续看
+- **全链路取消**：HTTP 层取消令牌贯穿引擎，断连即停、已产出部分不浪费
+- **预算治理**：每回合 LLM 调用 / 工具调用 / token / 来源数量 / 总时长硬上限
+
+### 检索与工具
+
+- **三路混合检索**：Milvus 语义 + Elasticsearch BM25 + Neo4j 知识图谱，RRF 融合排序，逐路熔断降级；`lightweight` 离线档（Chroma + BM25）与 `local` 极简档（纯 SQLite）零外部依赖可跑
+- **MCP 协议客户端**：Streamable HTTP 传输、自动发现注册，与内置工具统一执行契约
+- **双层人工审批**：计划级（研究开始前）+ 工具级（危险命令实时拦截），审批记录持久化
+- **声明式工具注册**：`tools.example.yaml` 声明内置工具开关与 MCP server，启动时装配
+
+### 智能体基础能力
+
+- **多模式对话**：`rag_agent`（计划+子代理）/ `rag`（轻量检索）/ `react`（工具链）自动路由，两级意图漏斗（关键词 + 可灰度的 LLM 复核）
+- **三层记忆**：短期（滑动窗口）/ 长期（Embedding+TF 双层，去重/合并/衰减）/ 用户偏好（LLM+规则），Neo4j 图增强召回
+- **沙箱执行**：Docker / Local / Mock 三种后端，资源限制与命令白名单
+
+### 质量工程
+
+- **678 项自动化测试**（含取消、断连、并发、恢复重放、沙箱生命周期）+ ruff 正确性门禁 + GitHub Actions CI
+- **内置评测平台**：不可变数据集、确定性指标、Trace 全链路、Badcase 回归与版本对比
+- **确定性离线示例**：`examples/research/offline_demo.py` 不配置任何模型即可验证两轮研究与引用报告
+
+## 架构总览
 
 ```mermaid
 graph TB
-    CTRL["HTTP 路由层 (FastAPI /api/*)"]
-    R["Router 意图路由"]
-
-    subgraph Frontend["Vue 3 + Pinia 工作台"]
-        CHAT["对话区"]
-        SIDEBAR["知识库 / 近期对话"]
+    subgraph Client["Vue 3 + Pinia"]
+        WB["研究工作台<br/>计划审批 / 过程观察 / 报告阅读"]
     end
-
-    subgraph Core["核心能力"]
-        CHAT_ENGINE["Stage 1: 多轮对话<br/>LLM + STM 历史注入"]
-        RAG_ENGINE["Stage 2: RAG<br/>Milvus + ES + Neo4j 三路检索 → RRF融合 → LLM合成"]
-        TOOL_ENGINE["Stage 3: 工具调用<br/>time / weather / search / exec_command"]
-        REACT_ENGINE["Stage 4: ReAct<br/>Planner → Executor → Generator"]
+    subgraph Server["FastAPI (port 8090)"]
+        API["HTTP 边界<br/>chat SSE · run 重放 · 文档 · 工具"]
+        RS["RunService 运行调度<br/>SQLite 台账 · 租约/围栏 · 事件重放"]
+        P["Planner 规划器"]
+        G["GraphRuntime 图执行<br/>拓扑分层 · 并行子代理"]
+        RE["ResearchEngine 研究引擎<br/>迭代循环 · 来源账本 · 引用报告"]
     end
-
-    subgraph Memory["Stage 5: 三层记忆"]
-        STM["短期记忆<br/>滑动窗口"]
-        LTM["长期记忆<br/>Embedding语义 + Neo4j图关系"]
-        PREF["用户偏好<br/>LLM NER提取"]
+    subgraph Tools["工具层"]
+        TAV["Tavily 搜索/抓取"]
+        RAG["混合检索<br/>Milvus+ES+Neo4j RRF"]
+        SBX["Docker 沙箱"]
+        MCP["MCP Servers"]
     end
-
-    subgraph Harness["Stage 6: 稳定执行"]
-        RETRY["重试机制"]
-        SNAP["快照恢复"]
-    end
-
-    subgraph Sandbox["沙箱执行"]
-        DOCKER["Docker 后端<br/>资源隔离 + 安全限制"]
-        LOCAL["Local 后端"]
-        MOCK["Mock 后端"]
-    end
-
-    subgraph Infra["基础设施 (全部可选, 优雅降级)"]
-        PG["PostgreSQL<br/>偏好/LTM/RAG Chunk持久化"]
-        MIL["Milvus<br/>语义向量近邻搜索"]
-        ES["Elasticsearch<br/>BM25全文检索"]
-        NEO["Neo4j<br/>知识图谱 + 图增强记忆"]
-        KAFKA["Kafka<br/>事件流"]
-    end
-
-    CHAT --> R
-    CTRL --> R
-
-    R -->|纯对话| CHAT_ENGINE
-    R -->|知识检索| RAG_ENGINE
-    R -->|单工具| TOOL_ENGINE
-    R -->|多工具编排| REACT_ENGINE
-
-    CHAT_ENGINE --> Memory
-    RAG_ENGINE --> Memory
-    TOOL_ENGINE --> Memory
-    REACT_ENGINE --> Memory
-    REACT_ENGINE --> Harness
-
-    TOOL_ENGINE --> Sandbox
-    REACT_ENGINE --> Sandbox
-    Sandbox --> DOCKER
-    Sandbox --> LOCAL
-    Sandbox --> MOCK
-
-    RETRY --> SNAP
-    SNAP --> PG
-
-    STM -.->|多轮历史| CHAT_ENGINE
-    LTM -.->|跨会话恢复| CHAT_ENGINE
-    PREF -.->|个性化上下文| CHAT_ENGINE
-
-    LTM --> PG
-    LTM --> NEO
-    PREF --> PG
-    RAG_ENGINE --> MIL
-    RAG_ENGINE --> ES
-    RAG_ENGINE --> NEO
-    CHAT_ENGINE --> KAFKA
-
-    SIDEBAR -->|上传文档| RAG_ENGINE
+    WB -->|SSE| API --> RS
+    RS --> P -->|AWAITING_PLAN_REVIEW 暂停| WB
+    WB -->|approve/edit| RS --> G --> RE
+    RE --> TAV & RAG & SBX & MCP
 ```
 
-
-## 核心流程时序图
-
-```mermaid
-sequenceDiagram
-    actor User
-    participant FE as 前端
-    participant Router as 智能路由
-    participant LLM as LLM API
-    participant Planner as Planner LLM
-    participant Executor as Executor
-    participant Tool as Tool / RAG / Sandbox
-    participant Generator as Generator LLM
-    participant Memory as 三层记忆
-    participant DB as PostgreSQL
-
-    User->>FE: 输入消息 + 选择工具
-    FE->>Router: POST /api/chat {message, tools}
-
-    alt 纯对话 (无工具)
-        Router->>Memory: 加载 STM 历史 + LTM + 偏好
-        Memory-->>Router: 上下文消息列表
-        Router->>LLM: Chat(systemPrompt + 历史 + 当前消息)
-        LLM-->>Router: 自然语言回答
-        Router->>Memory: 异步提取偏好 + 存储长期记忆
-
-    else 工具编排 (ReAct)
-        Router->>Planner: 分析query + 工具列表 → 执行计划
-        Planner-->>Router: [{tool, params, reason}, ...]
-
-        loop 按计划逐步执行
-            Router->>Executor: 执行 tool(params)
-            Executor->>Tool: 调用具体工具
-            Tool-->>Executor: 观察结果
-            Executor-->>Router: 步骤结果 (思考 → 动作 → 观察)
-            Router->>DB: 保存快照
-        end
-
-        Router->>Generator: 合成所有观察 → 最终答案
-        Generator-->>Router: 自然语言回答
-        Router->>Memory: 异步存储长期记忆 + 提取偏好
-    end
-
-    Router-->>FE: {answer, steps, memories}
-    FE-->>User: 渲染回答 + 思考过程
-```
-
-
-## RAG 三路混合检索流程图
-
-```mermaid
-sequenceDiagram
-    actor User
-    participant RAG as RAG Engine
-    participant EMB as Embedding API
-    participant MIL as Milvus
-    participant ES as Elasticsearch
-    participant NEO as Neo4j
-    participant PG as PostgreSQL
-    participant LLM as LLM API
-
-    User->>RAG: 查询: "量子计算的应用领域"
-    RAG->>EMB: Embed(query)
-    EMB-->>RAG: query向量 [0.12, -0.34, ...]
-
-    par 三路并行检索
-        RAG->>MIL: MilvusSearch(query向量, topK)
-        MIL-->>RAG: 语义结果 [{pg_id, distance}, ...]
-        RAG->>ES: BM25Search(query, topK)
-        ES-->>RAG: 关键词结果 [{pg_id, score}, ...]
-        RAG->>NEO: GraphSearch(实体, maxHops=2)
-        NEO-->>RAG: 图谱结果 [{pg_id, weight}, ...]
-    end
-
-    RAG->>RAG: RRF融合排序<br/>score = Σ(1/(k+rank_i)) × weight_i<br/>语义0.7 + BM25权重 + 图0.3
-
-    RAG->>PG: LoadRAGChunksByIDs(top_pg_ids)
-    PG-->>RAG: [{id, content}, ...]
-
-    RAG->>LLM: Chat(系统提示 + 检索上下文 + 用户问题)
-    LLM-->>RAG: 基于知识的回答
-
-    RAG-->>User: 回答 + 引用来源
-```
-
-
-## 记忆系统详细流程图
-
-```mermaid
-sequenceDiagram
-    actor User
-    participant Agent as Agent
-    participant STM as 短期记忆<br/>(滑动窗口 N×2)
-    participant LLM as LLM API
-    participant EMB as Embedding API
-    participant LTM as 长期记忆<br/>(Embedding+TF双层)
-    participant GRAPH as Neo4j图增强
-    participant PREF as 用户偏好<br/>(LLM NER+规则双重)
-    participant PG as PostgreSQL
-
-    Note over User,PG: ═══════════ 服务启动: 跨会话恢复 ═══════════
-    Agent->>PG: LoadPreferences(userID)
-    PG-->>Agent: 历史偏好 [{key, value}, ...]
-    Agent->>PREF: SaveBatch(恢复偏好到内存)
-    Agent->>PG: LoadLongTermItems()
-    PG-->>Agent: 历史LTM [{id, content, embedding, importance}, ...]
-    Agent->>LTM: StoreItem(逐条恢复到内存索引)
-    Note right of LTM: 重建TF词表<br/>恢复Embedding向量
-    Agent->>GRAPH: 重建记忆节点与关系
-    Agent->>STM: 初始化空窗口
-
-    Note over User,PG: ═══════════ 每轮对话: 读取阶段 ═══════════
-    User->>Agent: "你好，我叫小明，我喜欢打篮球"
-    Agent->>STM: Add(user, 消息)
-
-    Agent->>LTM: Recall(query, topK=3, queryEmbedding?)
-    alt Embedding API 可用
-        Agent->>EMB: Embed(query)
-        EMB-->>LTM: query向量
-        loop 遍历所有LTM条目
-            LTM->>LTM: cosine(queryEmb, itemEmb)
-            LTM->>LTM: score = sim×0.7 + importance×0.3
-            alt score ≥ 0.4 阈值
-                LTM->>LTM: 更新item.LastAccessed
-                LTM->>LTM: 加入候选集
-            else score < 0.4
-                Note right of LTM: 过滤噪声，不注入
-            end
-        end
-    else 降级: TF词袋
-        LTM->>LTM: buildVocab(query) 扩充词表
-        LTM->>LTM: textToVector(query) → TF向量
-        loop 遍历所有LTM条目
-            LTM->>LTM: cosine(queryTF, itemTF)
-            LTM->>LTM: score = sim×0.7 + importance×0.3
-        end
-    end
-    LTM-->>Agent: 召回记忆 [{content, score}, ...]
-
-    Agent->>GRAPH: GraphRecall(相关节点, maxHops=2)
-    GRAPH-->>Agent: 图扩展记忆 [关联历史, ...]
-
-    Agent->>PREF: BuildContext()
-    PREF-->>Agent: "【用户偏好】\n姓名: 小明\n喜好: 篮球"
-
-    Agent->>LLM: Chat(systemPrompt + 偏好 + LTM记忆 + 图记忆 + STM历史 + 当前消息)
-    LLM-->>Agent: "你好小明！喜欢篮球很棒..."
-
-    Note over User,PG: ═══════════ 每轮对话: 写入阶段 ═══════════
-    Agent->>STM: Add(assistant, 回答内容)
-
-    Agent->>LTM: Store(用户消息, importance, embedding?)
-    alt Embedding API 可用
-        Agent->>EMB: Embed(消息内容)
-        EMB-->>LTM: 语义向量
-        loop 去重检测: vs 每条已有条目
-            LTM->>LTM: cosine(newEmb, itemEmb)
-            alt sim ≥ 0.95 (去重阈值)
-                LTM->>LTM: 更新已有条目重要性+访问时间
-            else sim < 0.95
-                LTM->>LTM: 新增条目
-            end
-        end
-        LTM->>PG: SaveLongTermItem(content, vector, importance)
-    else 降级: TF词袋
-        LTM->>LTM: buildVocab + textToVector
-        LTM->>PG: SaveLongTermItem(content, nil, importance)
-    end
-
-    Agent->>GRAPH: 新增记忆节点 + 关系<br/>(FOLLOWS/SIMILAR_TO/CAUSES)
-
-    par 异步: LLM NER偏好提取
-        Agent->>LLM: "从以下对话提取用户偏好: ..."
-        LLM-->>Agent: {"姓名":"小明","喜好":"篮球"}
-        Agent->>PREF: SaveBatch(kvs)
-        PREF->>PG: SavePreference(key, value)
-    and 同步: 规则兜底 (立即生效)
-        Agent->>PREF: ExtractAndSave("我喜欢打篮球")
-        PREF-->>Agent: key="喜好", value="打篮球", ok=true
-        PREF->>PG: SavePreference(key, value)
-    end
-
-    Note over User,PG: ═══════════ 合并触发: 每5条新记忆 ═══════════
-    LTM->>LTM: NeedConsolidation()?
-    alt storeCount ≥ TriggerInterval(5)
-        Note over LTM: Phase 1: 重要性衰减
-        LTM->>LTM: importance × DecayRate^days<br/>(每日×0.995, 30天≈0.86)
-        Note over LTM: Phase 2: 去重 + 合并
-        loop 两两比较相似度
-            alt sim ≥ 0.95 (DedupThreshold)
-                LTM->>LTM: 保留importance更高的, 删除另一条
-                LTM->>PG: DELETE removed IDs
-                LTM->>GRAPH: 删除对应图节点
-            else sim ≥ 0.80 (SimilarityThreshold)
-                LTM->>LTM: mergeItems(): 内容拼接/保留较长
-                LTM->>PG: UPDATE merged item, DELETE被合并条目
-                LTM->>GRAPH: 合并图关系, 保护高中心度节点
-            end
-        end
-        Note over LTM: Phase 3: 过期淘汰
-        loop 检查每条记忆
-            alt days > TTL(30) AND importance < Min(0.3)
-                LTM->>LTM: 删除过期条目
-                LTM->>PG: DELETE expired IDs
-            end
-        end
-        LTM->>LTM: rebuildVocab() 重建词表
-    end
-
-    Note over User,PG: ═══════════ 会话结束 ═══════════
-    Note right of STM: 进程消亡, STM清除<br/>不持久化（设计如此）
-    Note right of LTM: 已实时持久化到PG<br/>Consolidation结果已同步
-    Note right of GRAPH: 图关系已持久化到Neo4j<br/>下次启动恢复
-    Note right of PREF: 已实时持久化到PG<br/>下次启动LoadPreferences恢复
-```
-
-
-## 技术实现亮点
-
-- **RAG 检索增强**：
-    - 支持三路混合检索（Milvus 语义向量、ES BM25 关键词、Neo4j 知识图谱），RRF 融合排序。
-    - 文本分块采用窗口重叠，提升召回覆盖率。
-    - 检索模式自动切换，单路故障自动降级，支持企业级高可用。
-    - 检索结果结构化，便于 LLM 合成与追溯。
-
-- **三层记忆系统**：
-    - 短期记忆：滑动窗口保存最近 N 轮对话。
-    - 长期记忆：Embedding/TF 双层，支持去重、合并、衰减、过期淘汰。
-    - 偏好记忆：LLM+规则自动提取用户偏好，持久化跨会话恢复。
-
-- **图增强记忆**：
-    - 记忆写入时自动建立时序（FOLLOWS）、相似（SIMILAR_TO）等关系。
-    - 支持图扩展召回，发现间接关联历史记忆。
-    - 合并淘汰时保护高中心度节点，防止核心知识丢失。
-
-- **智能体与工具链**：
-    - 路由优先级：ReAct 复合推理 > 单工具 > RAG 检索 > 纯对话。
-    - 工具链支持自定义扩展，RAG 检索作为知识库工具无缝集成。
-    - ReAct 规划-执行-生成流程，任务快照与重试机制保障稳定性。
-
-- **沙箱执行**：
-    - 支持 Docker（资源隔离 + 安全限制）、Local（直接执行）、Mock（测试）三种后端。
-    - 命令长度限制、白名单校验、资源配额（CPU/内存/PID/网络/只读文件系统）。
-
-- **工程与基础设施**：
-    - PostgreSQL 持久化所有关键数据。
-    - Milvus/ES/Neo4j/Kafka 可选，自动降级，适配多种部署环境。
-    - 前后端解耦，支持多端接入。
-
----
+一次研究任务的状态流转：`创建 run → 生成计划 → **暂停待审批** → 人工批准/编辑 → 分步执行（research / code / write）→ 引用校验 → 报告产物落盘 → 完成`。任何一步崩溃都可从台账恢复。
 
 ## 快速开始
 
-### 本地运行
-
-```powershell
-Set-Location final
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
-Copy-Item .env.example .env
-# 编辑 .env 后，将变量加载到当前终端；详细命令见 final/README.md
-python -m alembic upgrade head
-python main.py
-```
-
-访问 `http://localhost:8090`，首次使用先注册账号。无需外部基础设施也可完整体验本地持久化、知识库和离线 Agent 评测。
-
-### Docker 部署
-
 ```bash
+# 方式一：一键本地启动（自动生成 JWT 密钥，SQLite 存储，无需任何外部数据库）
+python final/scripts/run_research_local.py
+# 打开 http://127.0.0.1:8090 注册账号 → 研究工作台输入目标
+
+# 方式二：标准部署（venv + conf.yaml + 前端构建）
 cd final
-docker compose up -d --build
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+cp config/conf.example.yaml config/conf.yaml   # 填入 LLM 与 Tavily key
+npm --prefix web ci && npm --prefix web run build
+AGI_CONFIG=config/conf.yaml uvicorn internal.application.bootstrap:create_app --factory --port 8090
+
+# 方式三：容器
+docker compose -f final/docker-compose.research.yml up --build -d
+
+# 不配模型，先跑离线示例验证全流程
+python final/examples/research/offline_demo.py
 ```
 
-### 配置
+联网搜索需要免费 [Tavily API key](https://app.tavily.com)；只研究本地上传文档时可不配置。完整步骤与命令行 API 示例见 **[研究快速开始](final/docs/research-quickstart.md)**。
 
-复制 `final/.env.example` 并通过环境变量提供凭证：
+## 典型使用流程
 
-- `AGI_JWT_SECRET` — 至少 32 位的随机字符串
-- `AGI_LLM_API_URL` / `AGI_LLM_API_KEY` / `AGI_LLM_MODEL`
-- `AGI_EMBEDDING_API_URL` / `AGI_EMBEDDING_API_KEY` / `AGI_EMBEDDING_MODEL`
-- `AGI_SEARCH_API_KEY` — 搜索服务 Key（可选）
+1. **发起**：研究工作台输入研究目标（或 `python final/scripts/demo_research.py '<问题>'`）
+2. **审批**：AI 产出分步计划 → 编辑步骤/依赖/验收条件 → 批准执行
+3. **观察**：实时看到研究轮次、来源摘录、代码执行；关掉页面后台继续跑，重连自动续看
+4. **报告**：分节展示、引用 `[n]` 悬浮跳转来源原文、一键下载 Markdown
 
-> 不要将真实 API Key 写入 Git。外部基础设施均为可选；连接失败会降级到 `final/runtime/` 下的本地 SQLite，而不是丢数据的内存 mock。
+## 配置
 
----
+| 文件 | 用途 |
+|---|---|
+| `final/config/conf.example.yaml` | 精简档：模型 / 检索 profile / 研究预算 / 工具声明，默认零外部依赖 |
+| `final/config/config.yaml` | 进阶档：PostgreSQL / Milvus / ES / Neo4j / Kafka 全套增强 |
+| `final/config/tools.example.yaml` | 声明式工具与 MCP server 注册 |
 
-## 目录结构
+优先级：`AGI_CONFIG` 显式路径 > `config.local.yaml` > `conf.yaml` > `config.yaml`；环境变量覆盖 YAML。
+
+## 文档
+
+| 文档 | 内容 |
+|---|---|
+| [研究快速开始](final/docs/research-quickstart.md) | 从克隆到跑通一次研究的完整步骤 |
+| [研究运行时架构](final/docs/research-architecture.md) | 计划审批状态机与研究引擎设计 |
+| [改造验收记录](final/docs/research-acceptance-20260926.md) | 真实模型端到端验收与已知边界 |
+| [原生 Agent 运行时重构](final/docs/原生Agent运行时重构.md) | 运行台账、租约围栏、恢复重放设计 |
+| [系统架构与核心流程图](final/docs/系统架构与核心流程图.md) | 全模块流程图 |
+| [RAG 可靠性与故障恢复运行手册](final/docs/RAG可靠性与故障恢复运行手册.md) | 检索链路降级与恢复 |
+| [Agent 质量评测平台使用指南](final/docs/Agent质量评测平台使用指南.md) | 评测数据集、指标与门禁 |
+
+## 项目结构
 
 ```
 ├── final/
-│   ├── main.py                       FastAPI 入口
-│   ├── web/                          Vue 3 + Pinia + Vite 前端
+│   ├── main.py                  # 启动入口（组合根 bootstrap.build_deps）
+│   ├── config/                  # conf.example.yaml（精简）/ config.yaml（全套）
 │   ├── internal/
-│   │   ├── agent/                    Agent、路由、恢复与用户实例注册表
-│   │   ├── application/              认证、技能、本地持久化
-│   │   ├── evaluation/               评测、Trace、Badcase 与报告
-│   │   ├── rag/ / memory/ / graph/   检索、记忆和知识图谱
-│   │   └── handler/                  HTTP、中间件和静态资源
-│   ├── alembic/                      17 段数据库迁移
-│   ├── tests/                        单元、契约、迁移与端到端测试
-│   ├── runtime/                      本地数据库和报告（运行时生成）
-│   ├── Dockerfile
-│   └── docker-compose.yml
-└── README.md
+│   │   ├── agent/               # turn_service 编排 / planner / run_scheduler / recovery
+│   │   ├── research/            # 研究引擎：迭代循环 / 来源账本 / 引用报告 / 沙箱 coder
+│   │   ├── handler/             # HTTP 边界：chat SSE / run 断线重放 / 文档 / 工具路由
+│   │   ├── rag/                 # 三路混合检索与降级
+│   │   ├── tools/               # 工具执行器 + MCP 客户端
+│   │   ├── harness/             # 危险工具审批与安全护栏
+│   │   ├── infra/               # 外部依赖生命周期，逐依赖熔断降级
+│   │   └── evaluation/          # 内置评测平台
+│   ├── web/                     # Vue 3 + Pinia（研究工作台 / PlanReview / ReportInline）
+│   ├── examples/research/       # 确定性离线示例
+│   ├── tests/                   # 678 项测试
+│   └── scripts/                 # run_research_local / demo_research / smoke_research
+└── LICENSE                      # MIT
 ```
 
----
+## 边界与路线
 
-## 致谢
+- 单进程线程模型，面向单实例部署；多实例水平扩展（无状态会话运行时）在路线图上
+- 未包含报告衍生的 PPT / 播客生成（DeerFlow 具备）；研究模式不承诺与 DeerFlow 功能全对齐
+- 引用校验保证"编号 ↔ 来源逐字对应"，不保证每条推断都被来源充分支持，高风险结论仍需人工审核
 
-本项目受多模态智能体、RAG、知识图谱、记忆增强等前沿研究启发，欢迎交流与合作。
+## License
+
+[MIT](LICENSE)
