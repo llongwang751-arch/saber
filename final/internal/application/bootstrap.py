@@ -43,8 +43,7 @@ def build_deps(cfg=None, *, infrastructure_factory=None, agent_factory=None, rou
     if cfg.pprof_enabled and not str(cfg.pprof_admin_token or "").strip():
         raise RuntimeError("PPROF_ADMIN_TOKEN is required when diagnostics are enabled")
     project = Path(__file__).resolve().parents[2]
-    frontend = project / "web" / "dist"
-    os.environ.setdefault("FRONTEND_DIR", str(frontend if frontend.is_dir() else project / "frontend"))
+    os.environ.setdefault("FRONTEND_DIR", str(project / "web" / "dist"))
     inf = (infrastructure_factory or Infrastructure)(cfg)
     agent = None
     try:

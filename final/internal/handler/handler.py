@@ -230,7 +230,7 @@ def setup_routes(
     register_document_routes(app, agent, inf, cfg)
 
     # 静态前端：仅在目录存在时挂载，避免容器内缺失目录直接崩
-    frontend_dir = os.environ.get("FRONTEND_DIR", "frontend")
+    frontend_dir = os.environ.get("FRONTEND_DIR", "web/dist")
     if os.path.isdir(frontend_dir):
         app.mount("/", StaticFiles(directory=frontend_dir, html=True), name="frontend")
     else:

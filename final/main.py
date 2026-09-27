@@ -15,10 +15,8 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-# Prefer the complete Vue build; keep the legacy single-file UI as fallback.
-vue_dist = os.path.join(PROJECT_ROOT, "web", "dist")
-legacy_frontend = os.path.join(PROJECT_ROOT, "frontend")
-os.environ.setdefault("FRONTEND_DIR", vue_dist if os.path.isdir(vue_dist) else legacy_frontend)
+# 静态前端统一使用 Vue 构建产物（web/dist；缺失时先在 web/ 下 npm run build）。
+os.environ.setdefault("FRONTEND_DIR", os.path.join(PROJECT_ROOT, "web", "dist"))
 
 from internal.application.bootstrap import Deps as Deps, build_deps as build_deps  # noqa: E402
 
