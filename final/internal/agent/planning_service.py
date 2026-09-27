@@ -74,14 +74,6 @@ def run_react_with_tools(
             agent.save_snapshot(task)
             return answer, [], task
 
-        if any(node.tool_name == "farm_copilot" for node in plan_nodes):
-            try:
-                from internal.application.farm_agent import detect_farm_guardrails
-
-                for guardrail in detect_farm_guardrails(query):
-                    _emit(on_event, "guardrail", guardrail)
-            except Exception:
-                pass
         _emit(
             on_event,
             "plan_created",

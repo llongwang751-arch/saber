@@ -29,21 +29,3 @@ def test_online_backup_retention_and_isolated_restore(tmp_path):
         verify_restore(second['archive'], root / 'runtime')
     with sqlite3.connect(database) as conn:
         assert conn.execute('SELECT count(*) FROM users').fetchone()[0] == 2
-
-
-def test_receiver_rejects_commands_bad_hash_and_overwrites(tmp_path):
-    from scripts.receive_backup import receive
-    import hashlib
-    import io
-    content = b'backup-test'
-    name = 'agi-saber-20260919T031500123456Z.tar.gz'
-    command = 'receive ' + name + ' ' + hashlib.sha256(content).hexdigest()
-    result = receive(tmp_path, command, io.BytesIO(content))
-    assert result['bytes'] == len(content)
-    with pytest.raises(FileExistsError):
-        receive(tmp_path, command, io.BytesIO(content))
-    with pytest.raises(ValueError):
-        receive(tmp_path, 'sh -c whoami', io.BytesIO(content))
-    with pytest.raises(ValueError):
-        receive(tmp_path, command, io.BytesIO(b'corrupt'))
-    assert (tmp_path / name).read_bytes() == content

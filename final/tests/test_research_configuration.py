@@ -13,18 +13,16 @@ def test_minimal_research_config_and_environment_override(tmp_path, monkeypatch)
     monkeypatch.setattr("config.config._load_dotenv_best_effort", lambda: None)
     monkeypatch.delenv("AGI_RAG_LIGHTWEIGHT", raising=False)
     path = tmp_path / "conf.yaml"
-    path.write_text("rag:\n  profile: lightweight\nfeatures:\n  medical: true\nresearch:\n  max_rounds: 4\ntools:\n  manifest: tools.yaml\n", encoding="utf-8")
-    monkeypatch.setenv("AGI_ENABLE_MEDICAL", "false")
+    path.write_text("rag:\n  profile: lightweight\nresearch:\n  max_rounds: 4\ntools:\n  manifest: tools.yaml\n", encoding="utf-8")
     monkeypatch.setenv("AGI_RESEARCH_MAX_ROUNDS", "5")
     cfg = default_config(str(path))
     assert cfg.rag_lightweight_enabled
-    assert not cfg.enable_medical and not cfg.enable_farm and not cfg.enable_experiments
     assert cfg.research_max_rounds == 5
     assert cfg.tools_manifest == str(tmp_path / "tools.yaml")
 
 
-@pytest.mark.parametrize("setting", ["research:\n  max_rounds: 0", "research:\n  max_sources: true", "features:\n  medical: perhaps", "rag:\n  profile: invalid"])
-def test_invalid_research_settings_fail_early(tmp_path, monkeypatch, setting):
+@pytest.mark.parametrize("setting", ["research:\n  max_rounds: 0", "research:\n  max_sources: true", "research:\n  timeout_seconds: -1", "features:\n  medical: true", "rag:\n  profile: invalid"])
+def test_invalid_or_removed_research_settings_fail_early(tmp_path, monkeypatch, setting):
     monkeypatch.setattr("config.config._load_dotenv_best_effort", lambda: None)
     path = tmp_path / "conf.yaml"
     path.write_text(setting, encoding="utf-8")
@@ -32,23 +30,19 @@ def test_invalid_research_settings_fail_early(tmp_path, monkeypatch, setting):
         default_config(str(path))
 
 
-@pytest.mark.parametrize("enabled", [False, True])
-def test_optional_features_are_absent_or_explicitly_enabled(tmp_path, monkeypatch, enabled):
+def test_removed_domain_routes_are_absent(tmp_path, monkeypatch):
     monkeypatch.setenv("AGI_EVAL_DATABASE_URL", f"sqlite:///{(tmp_path / 'app.db').as_posix()}")
     cfg = APIConfig()
-    cfg.enable_medical = cfg.enable_farm = cfg.enable_experiments = enabled
-    registered = []
-    agent = SimpleNamespace(status=lambda: {}, add_tool=lambda tool: registered.append(tool.name))
+    agent = SimpleNamespace(status=lambda: {})
     with TestClient(setup_routes(agent, SimpleNamespace(), cfg)) as client:
         features = client.get("/api/status").json()["features"]
-        assert features == {"research": True, "medical": enabled, "farm": enabled, "experiments": enabled}
+        assert features == {"research": True}
         routes = client.get("/openapi.json").json()["paths"]
-        assert ("/api/medical/score" in routes) == enabled
-        assert ("/api/farm/records" in routes) == enabled
-        assert any("/experiments" in path for path in routes) == enabled
-        assert ("medical_copilot" in registered) == enabled
-        assert client.get("/api/farm/records").status_code == (200 if enabled else 404)
-        assert (client.app.state.experiment_service is not None) == enabled
+        assert not any(path.startswith("/api/medical/") for path in routes)
+        assert not any(path.startswith("/api/farm/") for path in routes)
+        assert not any("/experiments" in path for path in routes)
+        assert client.get("/api/medical/score").status_code == 404
+        assert client.get("/api/farm/records").status_code == 404
 
 
 def test_manifest_disables_tools_and_discovers_only_enabled_servers(tmp_path):

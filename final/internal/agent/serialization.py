@@ -49,7 +49,6 @@ def _latest_structured_tool_result(steps: List[ReActStep]) -> Optional[Dict[str,
         evidence = payload.get("evidence")
         if (
             isinstance(evidence, dict)
-            and evidence.get("tool") == "farm_copilot"
             and payload.get("intent")
             and "answer" in payload
         ):

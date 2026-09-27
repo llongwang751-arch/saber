@@ -1,7 +1,7 @@
 
 # AGI-assistant：多模态智能体系统
 
-> Python 版现已加入 **AGI-Saber Research**：计划审核 → 迭代研究 → 引用报告，保留原生持久化运行时与 Vue 3。先看 [研究快速开始](final/docs/research-quickstart.md)；[架构与迁移边界](final/docs/research-architecture.md) 说明新旧链路如何共存。医疗、农场、在线实验为显式启用的扩展功能。
+> Python 版现已加入 **AGI-Saber Research**：计划审核 → 迭代研究 → 引用报告，保留原生持久化运行时与 Vue 3。先看 [研究快速开始](final/docs/research-quickstart.md)；[架构与迁移边界](final/docs/research-architecture.md) 说明新旧链路如何共存。
 
 AGI-assistant 是一个面向个人与企业的多模态智能体系统，融合了检索增强生成（RAG）、三层记忆、知识图谱、沙箱执行与可恢复执行流，支持多轮对话、知识检索、工具调用与复杂推理。系统具备高可用性、可扩展性与工程落地能力。
 
@@ -16,8 +16,8 @@ AGI-assistant 是一个面向个人与企业的多模态智能体系统，融合
 - **工具链与可恢复执行**：内置时间、天气、搜索、RAG 检索、命令执行等工具，支持 ReAct 规划-执行-生成流程，任务快照与重试机制保障稳定性。
 - **沙箱执行**：支持 Docker / Local / Mock 三种沙箱后端，资源限制（CPU/内存/PID/网络），命令白名单安全校验。
 - **质量评测闭环**：不可变数据集、Replay/Local/HTTP Adapter、10 项确定性指标、安全硬门禁、Trace、Badcase、回归对比与报告导出。
-- **多用户业务工作台**：JWT 登录与租户隔离，Vue 3 界面集成知识库、Skill 广场、智慧云诊室（预问诊/临床计算/用药安全）、记忆治理和 Agent 评测。
-- **双层持久化**：纯本地 SQLite 可保存文档、RAG、记忆、技能、门诊病历和评测数据；PostgreSQL、Milvus、ES、Neo4j、Kafka 可选增强。
+- **多用户业务工作台**：JWT 登录与租户隔离，Vue 3 界面集成知识库、Skill 广场、记忆治理和 Agent 评测。
+- **双层持久化**：纯本地 SQLite 可保存文档、RAG、记忆、技能和评测数据；PostgreSQL、Milvus、ES、Neo4j、Kafka 可选增强。
 
 ---
 
@@ -370,7 +370,7 @@ python -m alembic upgrade head
 python main.py
 ```
 
-访问 `http://localhost:8090`，首次使用先注册账号。无需外部基础设施也可完整体验本地持久化、知识库、智慧云诊室（预问诊/临床计算/用药安全）和离线 Agent 评测。
+访问 `http://localhost:8090`，首次使用先注册账号。无需外部基础设施也可完整体验本地持久化、知识库和离线 Agent 评测。
 
 ### Docker 部署
 
@@ -400,7 +400,7 @@ docker compose up -d --build
 │   ├── web/                          Vue 3 + Pinia + Vite 前端
 │   ├── internal/
 │   │   ├── agent/                    Agent、路由、恢复与用户实例注册表
-│   │   ├── application/              认证、技能、智慧养殖、本地持久化
+│   │   ├── application/              认证、技能、本地持久化
 │   │   ├── evaluation/               评测、Trace、Badcase 与报告
 │   │   ├── rag/ / memory/ / graph/   检索、记忆和知识图谱
 │   │   └── handler/                  HTTP、中间件和静态资源

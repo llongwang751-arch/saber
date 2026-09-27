@@ -13,13 +13,6 @@
       </button>
     </div>
 
-    <div v-if="features.medical" class="tools-btn-wrap">
-      <button class="tools-btn medical-entry" type="button" @click="$emit('open-medical')">
-        <svg class="control-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v16m-8-8h16"/></svg>
-        <span>智慧云诊室</span>
-      </button>
-    </div>
-
     <div v-if="features.research" class="tools-btn-wrap">
       <button class="tools-btn native-run-entry" type="button" @click="$emit('open-research')">
         <svg class="control-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10" cy="10" r="6"/><path d="m15 15 5 5M7 10h6M10 7v6"/></svg>
@@ -55,8 +48,8 @@
 import { useChat } from '../stores/chat'
 import { useSkills } from '../stores/skills'
 
-defineProps({ features: { type: Object, default: () => ({ research: true, medical: false, experiments: false }) } })
-defineEmits(['open-skills', 'open-medical', 'open-evaluation', 'open-rag-lab', 'open-native-runs', 'open-research'])
+defineProps({ features: { type: Object, default: () => ({ research: true }) } })
+defineEmits(['open-skills', 'open-evaluation', 'open-rag-lab', 'open-native-runs', 'open-research'])
 const chat = useChat()
 const skills = useSkills()
 </script>
@@ -66,8 +59,6 @@ const skills = useSkills()
 .controls-right.hint-pink { color: var(--pink-d); }
 .controls-right.hint-muted { color: var(--text3); }
 .control-icon { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
-.medical-entry { color: #0284c7; border-color: rgba(2,132,199,.25); }
-.medical-entry:hover { background: #f0f9ff; }
 .eval-entry { color: #b91c4f; border-color: rgba(185,28,79,.25); }
 .eval-entry:hover { background: #fff1f5; }
 .eval-mark { font: 750 10px/1 ui-monospace, SFMono-Regular, Consolas, monospace; letter-spacing: .04em; }

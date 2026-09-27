@@ -14,27 +14,13 @@ LIMITS = {
 }
 
 
-def boolean(value, name):
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str) and value.strip().lower() in {"1", "true", "yes", "on", "0", "false", "no", "off"}:
-        return value.strip().lower() in {"1", "true", "yes", "on"}
-    raise ValueError(f"{name} must be a boolean")
-
-
 def initialize(cfg):
-    for name in ("medical", "farm", "experiments"):
-        setattr(cfg, f"enable_{name}", False)
     for key, (default, _, _) in LIMITS.items():
         setattr(cfg, f"research_{key}", default)
     cfg.tools_manifest = ""
 
 
 def configure(cfg, data):
-    features = data.get("features") or {}
-    for name in ("medical", "farm", "experiments"):
-        value = os.getenv(f"AGI_ENABLE_{name.upper()}", features.get(name, False))
-        setattr(cfg, f"enable_{name}", boolean(value, f"features.{name}"))
     research = data.get("research") or {}
     for key, (default, low, high) in LIMITS.items():
         raw = os.getenv(f"AGI_RESEARCH_{key.upper()}", research.get(key, default))
@@ -47,5 +33,4 @@ def configure(cfg, data):
 
 
 def feature_status(cfg):
-    return {"research": True, **{name: bool(getattr(cfg, f"enable_{name}", False))
-                               for name in ("medical", "farm", "experiments")}}
+    return {"research": True}

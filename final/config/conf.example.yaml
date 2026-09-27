@@ -19,10 +19,6 @@ research:
   max_output_tokens: 6000
   max_context_chars: 24000
   timeout_seconds: 300
-features:
-  medical: false
-  farm: false
-  experiments: false
 tools:
   manifest: tools.example.yaml
 sandbox:

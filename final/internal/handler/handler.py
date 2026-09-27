@@ -47,10 +47,6 @@ from .http_contracts import (
     _sanitize_stream_done as _sanitize_stream_done,
     _normalize_ingest_result as _normalize_ingest_result,
 )
-from .chat_experiments import (
-    _begin_online_rag_exposure as _begin_online_rag_exposure,
-    _finish_online_rag_exposure as _finish_online_rag_exposure,
-)
 from .chat_routes import register_chat_routes
 from .document_routes import register_document_routes
 from .tool_routes import register_tool_routes
@@ -144,17 +140,6 @@ def setup_routes(
     if auth_required:
         evaluation_registry = EvaluationServiceRegistry(local_agent_factory=app.state.agent_registry.get)
         app.state.evaluation_service_registry = evaluation_registry
-        experiment_service = getattr(app.state, "experiment_service", None)
-        if experiment_service is not None:
-            application_store_ready = bool(getattr(experiment_service, "production_evidence_ready", False))
-            experiment_service.production_evidence_ready = bool(
-                application_store_ready and evaluation_registry.production_shared_ready
-            )
-            experiment_service.production_evidence_backends = {
-                "application": getattr(experiment_service, "storage_backend", "unknown"),
-                "offline_evaluation": evaluation_registry.storage_backend,
-                "shared_offline_evaluation": (evaluation_registry.production_shared_ready),
-            }
         register_shutdown(app, evaluation_registry.close)
 
     @app.middleware("http")

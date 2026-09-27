@@ -5,8 +5,6 @@ import inspect
 import logging
 import queue
 import threading
-import time
-import uuid
 
 from fastapi import HTTPException, Request, Response as HTTPResponse
 from fastapi.responses import StreamingResponse
@@ -17,11 +15,9 @@ from internal.agent.contracts import ChatOptions
 from internal.agent.cancel import CancelToken
 from internal.agent.run_service import RunConflict, RunCapacityExceeded
 from internal.application.run_runtime import get_run_service
-from internal.experimentation.public import redact_public_experiment_trace
 
 from .models import ChatRequest
 from .http_contracts import _response_to_dict, _rag_result_to_main_contract, _sse, _jsonable, _sanitize_stream_done
-from .chat_experiments import _begin_online_rag_exposure, _finish_online_rag_exposure
 
 logger = logging.getLogger(__name__)
 
@@ -51,47 +47,19 @@ def _cancel_kwargs(method, token):
 def register_chat_routes(app, agent, inf, cfg):
     @app.post("/api/chat")
     async def chat(req: ChatRequest, request: Request, http_response: HTTPResponse):
-        exposure = None
-        response = None
         observation = None
         token = CancelToken()
-        started = time.perf_counter()
         try:
             active_agent = current_agent(request)
             opts = ChatOptions(use_rag=req.use_rag, conversation_id=req.conversation_id)
-            # The validated request id is also the turn/trace id.  A client
-            # that falls back from SSE to sync with the same X-Request-ID gets
-            # the same idempotent exposure instead of being counted twice.
-            trace_id = str(getattr(request.state, "request_id", "") or uuid.uuid4())
-            exposure, execution_context = _begin_online_rag_exposure(
-                request,
-                req,
-                active_agent,
-                trace_id,
-            )
             observation = _observe_run(request, active_agent, req, token)
             http_response.headers["X-Saber-Run-ID"] = observation.run_id
             call_kwargs = _cancel_kwargs(active_agent.process_with_options, token)
-            if execution_context is None:
-                response = await run_in_threadpool(
-                    active_agent.process_with_options,
-                    req.message,
-                    opts,
-                    **call_kwargs,
-                )
-            else:
-                response = await run_in_threadpool(
-                    active_agent.process_with_options,
-                    req.message,
-                    opts,
-                    execution_context,
-                    **call_kwargs,
-                )
-            _finish_online_rag_exposure(
-                request,
-                exposure,
-                response=response,
-                started=started,
+            response = await run_in_threadpool(
+                active_agent.process_with_options,
+                req.message,
+                opts,
+                **call_kwargs,
             )
             payload = _response_to_dict(response)
             observation.finish(payload)
@@ -103,13 +71,6 @@ def register_chat_routes(app, agent, inf, cfg):
         except Exception as e:
             if observation is not None:
                 observation.fail()
-            _finish_online_rag_exposure(
-                request,
-                exposure,
-                response=response,
-                started=started,
-                error=e,
-            )
             logger.error("聊天接口错误: %s", e)
             raise HTTPException(status_code=500, detail=str(e))
 
@@ -120,16 +81,6 @@ def register_chat_routes(app, agent, inf, cfg):
         opts = ChatOptions(use_rag=req.use_rag, conversation_id=req.conversation_id)
 
         active_agent = current_agent(request)
-        # Resolve the experiment exposure before response headers are sent, so
-        # duplicate/conflicting idempotency keys produce a real HTTP 409 rather
-        # than failing inside an already-open SSE stream.
-        trace_id = str(getattr(request.state, "request_id", "") or uuid.uuid4())
-        exposure, execution_context = _begin_online_rag_exposure(
-            request,
-            req,
-            active_agent,
-            trace_id,
-        )
         registry = getattr(active_agent, "_cancel_registry", None)
         if registry is not None:
             token, unregister = registry.register()
@@ -176,39 +127,22 @@ def register_chat_routes(app, agent, inf, cfg):
                                     if isinstance(item, dict)
                                 ],
                             }
-                        if event_type == "rag_trace":
-                            data = redact_public_experiment_trace(
-                                data,
-                                experiment_active=bool(exposure),
-                            )
                         if event_type == "done":
-                            exposure_id_hint = ""
-                            if isinstance(exposure, dict):
-                                exposure_id_hint = str(
-                                    exposure.get("opaque_exposure_id")
-                                    or exposure.get("exposure_id")
-                                    or exposure.get("id")
-                                    or ""
-                                )
-                            data = _sanitize_stream_done(
-                                data,
-                                exposure_id_hint=exposure_id_hint,
-                            )
+                            data = _sanitize_stream_done(data)
                         if event_type:
                             observation.event(event_type, data)
                             rendered = _sse(event_type, data)
                             if event_type == "done":
-                                # The opaque feedback handle is useful only
-                                # after its exposure has a terminal ledger
-                                # state.  Buffer the final event so a fast UI
-                                # click cannot race ``finish_exposure``.
+                                # Buffer the final event so it can only be
+                                # emitted after the worker finished cleanly;
+                                # the worker enqueues it (or a fallback done)
+                                # exactly once.
                                 deferred_done.append(rendered)
                             else:
                                 enqueue(rendered)
 
                     def _run_process_stream():
                         response = None
-                        started = time.perf_counter()
                         # 真实 UnifiedAgent 支持复用 HTTP 层取消令牌（断连即取消）；
                         # 测试替身可能是窄签名，不支持时不强传。
                         stream_kwargs = (
@@ -218,26 +152,11 @@ def register_chat_routes(app, agent, inf, cfg):
                             else {}
                         )
                         try:
-                            if execution_context is None:
-                                response = active_agent.process_stream(
-                                    req.message,
-                                    opts,
-                                    _on_event,
-                                    **stream_kwargs,
-                                )
-                            else:
-                                response = active_agent.process_stream(
-                                    req.message,
-                                    opts,
-                                    _on_event,
-                                    execution_context,
-                                    **stream_kwargs,
-                                )
-                            _finish_online_rag_exposure(
-                                request,
-                                exposure,
-                                response=response,
-                                started=started,
+                            response = active_agent.process_stream(
+                                req.message,
+                                opts,
+                                _on_event,
+                                **stream_kwargs,
                             )
                             observation.finish(_response_to_dict(response) if response is not None else {})
                             if deferred_done:
@@ -248,13 +167,6 @@ def register_chat_routes(app, agent, inf, cfg):
                         except Exception as e:
                             deferred_done.clear()
                             observation.fail()
-                            _finish_online_rag_exposure(
-                                request,
-                                exposure,
-                                response=response,
-                                started=started,
-                                error=e,
-                            )
                             logger.error("流式聊天 process_stream 失败: %s", e)
                             enqueue(_sse("done", {"answer": f"请求失败: {e}", "interrupted": False, "success": False}))
                         finally:
@@ -272,41 +184,9 @@ def register_chat_routes(app, agent, inf, cfg):
 
                 try:
                     execution_started = True
-                    started = time.perf_counter()
-                    if hasattr(active_agent, "_dispatch") and registry is not None:
-                        if execution_context is None:
-                            resp = active_agent._dispatch(req.message, opts, token)
-                        else:
-                            resp = active_agent._dispatch(
-                                req.message,
-                                opts,
-                                token,
-                                execution_context=execution_context,
-                            )
-                    else:
-                        if execution_context is None:
-                            resp = active_agent.process_with_options(req.message, opts)
-                        else:
-                            resp = active_agent.process_with_options(
-                                req.message,
-                                opts,
-                                execution_context,
-                            )
-                    _finish_online_rag_exposure(
-                        request,
-                        exposure,
-                        response=resp,
-                        started=started,
-                    )
+                    resp = active_agent.process_with_options(req.message, opts)
                 except Exception as e:
                     observation.fail()
-                    _finish_online_rag_exposure(
-                        request,
-                        exposure,
-                        response=None,
-                        started=started,
-                        error=e,
-                    )
                     logger.error("流式聊天 _dispatch 失败: %s", e)
                     yield _sse("done", {"answer": f"请求失败: {e}", "interrupted": False, "success": False})
                     return
@@ -364,7 +244,7 @@ def register_chat_routes(app, agent, inf, cfg):
                             events.get_nowait()
                     except queue.Empty:
                         pass
-                    events.put_nowait(sentinel)
+                    events.put_nowait(sentinel if events else None)
                 try:
                     unregister()
                 except Exception:
@@ -375,3 +255,4 @@ def register_chat_routes(app, agent, inf, cfg):
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Saber-Run-ID": observation.run_id},
         )
+

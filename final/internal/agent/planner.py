@@ -109,8 +109,6 @@ def llm_plan_steps(agent, query: str, tools_map: Dict[str, Any], mem_prefix: str
     valid: List[PlanItem] = []
     for item in items:
         if item.tool in tools_map and _tool_matches_query(item.tool, tools_map[item.tool], query, llm_selected=True):
-            if item.tool in {"medical_copilot", "farm_copilot"} and not item.params.get("query"):
-                item.params["query"] = query
             valid.append(item)
     return valid
 
@@ -200,8 +198,6 @@ def llm_plan_graph(
             params = item.get("parameters")
         if not isinstance(params, dict):
             params = {}
-        if executor in {"medical_copilot", "farm_copilot"} and not params.get("query"):
-            params["query"] = query
         if graph_type == NodeType.SUBAGENT and not params.get("goal"):
             params["goal"] = str(item.get("goal") or item.get("reason") or "")
         node_id = str(item.get("id") or f"n{idx + 1}")
@@ -266,8 +262,6 @@ def rule_plan_items(agent, query: str, tools_map: Dict[str, Any]) -> List[PlanIt
         if name in builtins or name not in custom_matches:
             continue
         params: Dict[str, str] = {}
-        if name == "farm_copilot":
-            params["query"] = query
         for p in getattr(t, "params", []) or []:
             if p.get("required") and p.get("name") not in params:
                 params[p.get("name", "")] = query
@@ -316,8 +310,6 @@ def rule_plan_nodes(
         if not matched:
             continue
         params: Dict[str, str] = {}
-        if name == "farm_copilot":
-            params["query"] = query
         for p in getattr(tool, "params", []) or []:
             if p.get("required") and p.get("name") not in params:
                 params[str(p.get("name") or "")] = query
@@ -551,8 +543,6 @@ def llm_replan(
         params = item.get("params") or {}
         if not isinstance(params, dict):
             params = {}
-        if executor in {"medical_copilot", "farm_copilot"} and not params.get("query"):
-            params["query"] = query
         if node_type == NodeType.SUBAGENT and not params.get("goal"):
             params["goal"] = str(item.get("goal") or item.get("reason") or "")
         result.append(Node(

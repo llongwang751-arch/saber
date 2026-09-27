@@ -75,7 +75,7 @@ docker compose -f docker-compose.research.yml up --build -d
 
 ## 可调整边界
 
-`research` 配置控制轮次、LLM 调用、工具调用、来源数量、上下文、输出 token 和总时限。`features.medical/farm/experiments` 默认关闭；对应环境变量为 `AGI_ENABLE_MEDICAL/FARM/EXPERIMENTS`。旧业务实现和回归测试保留，评测平台仍可使用。
+`research` 配置控制轮次、LLM 调用、工具调用、来源数量、上下文、输出 token 和总时限。
 
 `tools.manifest` 指向声明式工具配置，相对路径以配置文件所在目录为基准。`builtins` 支持 `search_web`、`rag_search`、`exec_command` 开关；`mcp_servers` 在启动时走现有 MCP 握手/发现。开关不会替你配置密钥或提供沙箱。研究步骤的工具策略进一步限制该步骤可使用的能力。
 

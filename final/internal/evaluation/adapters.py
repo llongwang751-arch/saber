@@ -506,7 +506,7 @@ def _normalise_local_events(raw_events: list[dict[str, Any]], response: Any) -> 
             trace.insert(insert_at + offset, TraceEvent(
                 sequence=insert_at + offset,
                 event_type=TraceEventType.GUARDRAIL.value,
-                name=str(guardrail.get("id") or "farm_guardrail"),
+                name=str(guardrail.get("id") or "domain_guardrail"),
                 payload=dict(guardrail),
             ))
         trace = [event.model_copy(update={"sequence": index}) for index, event in enumerate(trace)]
@@ -566,8 +566,9 @@ def _agent_uses_real_llm(agent: Any) -> bool:
 
 def _structured_domain_output(response: Any) -> Mapping[str, Any] | None:
     for call in reversed(_tool_calls_from_local_response(response)):
-        if call.name == "farm_copilot" and isinstance(call.result, Mapping):
-            return call.result
+        result = call.result if isinstance(call.result, Mapping) else None
+        if result is not None and ("evidence" in result or "intent" in result):
+            return result
     return None
 
 

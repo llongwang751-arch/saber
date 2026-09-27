@@ -9,7 +9,7 @@ import json
 import re
 import threading
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from internal.document.library import DOCUMENT_SOURCE_AGENT, WriteRequest
 
@@ -49,20 +49,6 @@ def register_builtin_subagents(agent) -> SubAgentRegistry:
         WriterAgent(agent),
         ReviewAgent(agent),
         DocAgent(agent),
-    ):
-        registry.register(subagent)
-    if getattr(getattr(agent, "cfg", None), "enable_medical", False):
-        register_medical_subagents(agent, registry)
-    return registry
-
-
-def register_medical_subagents(agent, registry: Optional[SubAgentRegistry] = None) -> SubAgentRegistry:
-    """Register medical domain subagents."""
-    if registry is None:
-        registry = SubAgentRegistry()
-    for subagent in (
-        MedicalTriageAgent(agent),
-        DrugSafetyReviewAgent(agent),
     ):
         registry.register(subagent)
     return registry
@@ -386,46 +372,3 @@ def _jsonable(value):
     if hasattr(value, "__dataclass_fields__"):
         return _jsonable(asdict(value))
     return value
-
-
-class MedicalTriageAgent:
-    """分诊评估子智能体：解析主诉与病史，检查急症红线与缺失诊断要素。"""
-
-    def __init__(self, agent):
-        self.agent = agent
-
-    def name(self) -> str:
-        return "medical_triage_agent"
-
-    def description(self) -> str:
-        return "临床分诊专家：解析患者主诉、病程与既往史，筛查急症红线与缺失诊断要素。"
-
-    def run(self, task: SubAgentTask) -> str:
-        query = task.query or task.goal
-        from internal.application.medical import check_emergency_redline
-        emergency = check_emergency_redline(query)
-        if emergency:
-            return f"🚨【S0急危重症拦截】{emergency['condition_name']}：{emergency['action_guide']}"
-        return f"🩺【预问诊分析】已解析患者主诉：'{query}'。建议结合发病时长、伴随症状与既往史展开鉴别诊断。"
-
-
-class DrugSafetyReviewAgent:
-    """用药安全审查子智能体：确定性排查配伍禁忌与过敏冲突。"""
-
-    def __init__(self, agent):
-        self.agent = agent
-
-    def name(self) -> str:
-        return "drug_safety_agent"
-
-    def description(self) -> str:
-        return "临床用药安全审查专家：确定性筛查药物配伍禁忌 (DDI) 与已知过敏原交叉反应。"
-
-    def run(self, task: SubAgentTask) -> str:
-        query = task.query or task.goal
-        from internal.application.medical import check_drug_safety
-        known_drugs = ["华法林", "阿司匹林", "硝酸甘油", "西地那非", "二甲双胍", "奥美拉唑", "氯吡格雷", "螺内酯", "辛伐他汀", "克拉霉素", "青霉素", "头孢", "造影剂"]
-        drugs = [d for d in known_drugs if d in query]
-        allergies = [a for a in ["青霉素", "头孢", "磺胺"] if a in query and "过敏" in query]
-        res = check_drug_safety(drugs, allergies)
-        return json.dumps(res, ensure_ascii=False)

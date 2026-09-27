@@ -8,14 +8,12 @@ from typing import Any, Dict
 
 
 from internal.agent.agent import Response
-from internal.experimentation.public import redact_public_experiment_trace
 
 
 logger = logging.getLogger(__name__)
 
 
 def _response_to_dict(resp: Response) -> Dict[str, Any]:
-    exposure_id = str(getattr(resp, "experiment_exposure_id", "") or "")
     return {
         "query": resp.query,
         "answer": resp.answer,
@@ -36,10 +34,7 @@ def _response_to_dict(resp: Response) -> Dict[str, Any]:
         "tool_call": resp.tool_call,
         "tool_calls": resp.tool_calls,
         "search_results": [_rag_result_to_main_contract(r) for r in resp.search_results],
-        "rag_trace": redact_public_experiment_trace(
-            resp.rag_trace,
-            experiment_active=bool(exposure_id),
-        ),
+        "rag_trace": resp.rag_trace,
         "task": resp.task,
         "extracted_info": resp.extracted_info,
         "short_term_count": resp.short_term_count,
@@ -47,12 +42,6 @@ def _response_to_dict(resp: Response) -> Dict[str, Any]:
         "preferences": resp.preferences,
         "interrupted": resp.interrupted,
         "trace_id": resp.trace_id,
-        # Never reveal the assigned arm or candidate configuration to normal
-        # chat clients.  Feedback is linked through this opaque exposure id.
-        "experiment": {
-            "exposure_id": exposure_id,
-            "feedback_eligible": bool(exposure_id and not resp.error and not resp.interrupted),
-        },
         "success": not bool(resp.error),
     }
 
@@ -114,28 +103,12 @@ def _jsonable(value: Any) -> Any:
 
 def _sanitize_stream_done(
     data: Any,
-    *,
-    exposure_id_hint: str = "",
 ) -> dict[str, Any]:
-    """Expose only the opaque feedback handle, never arm/configuration details."""
+    """Drop internal runtime bookkeeping keys from the public done event."""
 
     payload = dict(data) if isinstance(data, dict) else {}
-    exposure_id = str(payload.pop("experiment_exposure_id", "") or exposure_id_hint or "")
+    payload.pop("experiment_exposure_id", None)
     payload.pop("runtime_strategy_checksum", None)
-    feedback_eligible = bool(
-        exposure_id
-        and not payload.get("error")
-        and not payload.get("interrupted")
-        and payload.get("success", True) is not False
-    )
-    payload = redact_public_experiment_trace(
-        payload,
-        experiment_active=bool(exposure_id),
-    )
-    payload["experiment"] = {
-        "exposure_id": exposure_id,
-        "feedback_eligible": feedback_eligible,
-    }
     return payload
 
 

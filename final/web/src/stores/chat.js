@@ -10,19 +10,6 @@ function requestId() {
     || `chat-${Date.now()}-${Math.random().toString(16).slice(2)}`
 }
 
-function opaqueExposureId(data) {
-  if (!data || typeof data !== 'object') return ''
-  if (data.success === false || data.interrupted === true || data.error) return ''
-  if (data.experiment?.feedback_eligible !== true) return ''
-  return String(data.experiment?.exposure_id || data.experiment?.opaque_exposure_id || '')
-}
-
-function rememberExposure(ai, data) {
-  const exposureId = opaqueExposureId(data)
-  ai.experimentExposureId = exposureId
-  ai.feedbackEligible = Boolean(exposureId)
-}
-
 export const useChat = defineStore('chat', {
   state: () => ({
     loading: false,
@@ -63,7 +50,6 @@ export const useChat = defineStore('chat', {
             ai.steps = data.steps.map(s => ({ type: s.type, content: s.content || '', params: s.params || null }))
           }
           if (data.interrupted) ai.interrupted = true
-          rememberExposure(ai, data)
           break
       }
     },
@@ -83,7 +69,6 @@ export const useChat = defineStore('chat', {
       const ai = sess.addMessage(sessionId, {
         role: 'ai', mode: 'chat', steps: [], memory: '', toolCall: null,
         ragResults: null, ragTrace: null, answer: '', interrupted: false, sandbox: '', streaming: true,
-        experimentExposureId: '', feedbackEligible: false, feedbackRating: null, feedbackEventId: '', feedbackLoading: false, feedbackError: '',
       })
 
       this.loading = true
@@ -113,8 +98,6 @@ export const useChat = defineStore('chat', {
         }
         docs.loadLibrary()
       } catch (e) {
-        ai.experimentExposureId = ''
-        ai.feedbackEligible = false
         if (e.name === 'AbortError') ai.answer = ai.answer || '🛑 已中断'
         else if (e.message !== 'unauthorized') {
           const detail = String(e.message || '').trim()
@@ -129,40 +112,6 @@ export const useChat = defineStore('chat', {
           this.loading = false
           this.abort = null
         }
-        sess.save()
-      }
-    },
-    async submitExperimentFeedback(message, rating) {
-      if (message?.feedbackEligible !== true || !message.experimentExposureId || message.feedbackLoading || message.feedbackRating != null) return
-      if (rating !== 1 && rating !== -1) return
-      const sess = useSessions()
-      const eventId = message.feedbackEventId || requestId()
-      message.feedbackEventId = eventId
-      message.feedbackAttemptedRating = message.feedbackAttemptedRating ?? rating
-      if (message.feedbackAttemptedRating !== rating) return
-      message.feedbackLoading = true
-      message.feedbackError = ''
-      sess.save()
-      try {
-        const response = await apiFetch(`/api/online-experiments/exposures/${encodeURIComponent(message.experimentExposureId)}/feedback`, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json', 'X-Request-ID': eventId },
-          body: JSON.stringify({ rating, event_id: eventId }),
-        })
-        const raw = await response.text()
-        let data = {}
-        if (raw) {
-          try { data = JSON.parse(raw) } catch { data = { detail: raw } }
-        }
-        if (!response.ok) throw new Error(data.detail || data.error || `HTTP ${response.status}`)
-        message.feedbackRating = rating
-        message.feedbackError = ''
-      } catch (error) {
-        message.feedbackError = error.message === 'unauthorized'
-          ? '登录状态已失效，请重新登录后重试。'
-          : `反馈未保存：${error.message || '请稍后重试'}`
-      } finally {
-        message.feedbackLoading = false
         sess.save()
       }
     },

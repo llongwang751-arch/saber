@@ -1,9 +1,8 @@
-"""FastAPI delivery layer for auth, skills, memory governance and farm APIs."""
+"""FastAPI delivery layer for auth, skills and memory governance APIs."""
 
 from __future__ import annotations
 
 import os
-from datetime import date
 from typing import Any
 
 import bcrypt
@@ -16,19 +15,9 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from internal.agent.agent import UnifiedAgent
 from internal.agent.registry import AgentRegistry
-from internal.document.library import DOCUMENT_SOURCE_AGENT, WriteRequest
-from internal.experimentation.api import create_experiment_router
-from internal.experimentation.public import redact_public_experiment_trace
-from internal.experimentation.runtime_identity import (
-    production_runtime_identity_from_environment,
-)
-from internal.experimentation.service import ExperimentService
-from internal.experimentation.store import ExperimentStore
 from internal.fastapi_compat import iter_all_routes, register_shutdown
 
 from .auth import AuthService, AuthenticationError, ValidationError
-from .medical import MedicalService
-from .medical_agent import build_medical_copilot_tool
 from .local_repos import install_local_repositories
 from .skills import SkillService
 from .store import ApplicationStore, ConflictError, NotFoundError
@@ -65,26 +54,6 @@ class MemoryQuarantine(RequestModel):
 class MemoryUnquarantine(RequestModel):
     id: int | None = None
     ids: list[int] = Field(default_factory=list)
-
-
-class MedicalScoreRequest(RequestModel):
-    score_type: str = "bmi"
-    params: dict[str, Any] = Field(default_factory=dict)
-
-
-class MedicalSafetyRequest(RequestModel):
-    drugs: list[str] = Field(default_factory=list)
-    allergies: list[str] = Field(default_factory=list)
-    conditions: list[str] = Field(default_factory=list)
-
-
-class MedicalSoapRequest(RequestModel):
-    patient_info: dict[str, Any] = Field(default_factory=dict)
-    subjective: dict[str, Any] = Field(default_factory=dict)
-    objective: dict[str, Any] = Field(default_factory=dict)
-    assessment: dict[str, Any] = Field(default_factory=dict)
-    plan: dict[str, Any] = Field(default_factory=dict)
-    save_document: bool = False
 
 
 PUBLIC_PATHS = {
@@ -144,14 +113,10 @@ def install_application_features(
         store,
         trace_retention_days=getattr(cfg, "trace_retention_days", 30),
     )
-    medical_holder: dict[str, MedicalService] = {}
 
     def make_agent(user_id: str):
         agent = UnifiedAgent(cfg, inf, user_id=user_id)
         skills.sync_agent(user_id, agent)
-        medical_service = medical_holder.get("service")
-        if medical_service is not None:
-            agent.add_tool(build_medical_copilot_tool(medical_service, user_id))
         return agent
 
     seed_user = _ensure_development_user(store, auth) if not auth_required else None
@@ -176,99 +141,13 @@ def install_application_features(
             seed_agent.rag._check_existing_chunks()
         seed_agent.chat_repo = getattr(inf.repo, "chat_history", None)
 
-    def write_medical_document(user_id: str, title: str, markdown: str, metadata: dict[str, Any]) -> str:
-        agent = registry.get(user_id)
-        result = agent.write_document(
-            WriteRequest(
-                title=title,
-                doc_type="medical_soap",
-                source=DOCUMENT_SOURCE_AGENT,
-                created_by=user_id,
-                content_md=markdown,
-                metadata=metadata,
-            ),
-            True,
-        )
-        document = (result or {}).get("document") or {}
-        return str(document.get("id") or "")
-
-    medical = MedicalService(document_writer=write_medical_document) if getattr(cfg, "enable_medical", False) else None
-    if medical is not None:
-        medical_holder["service"] = medical
-    if seed_user is not None and medical is not None:
-        add_tool = getattr(seed_agent, "add_tool", None)
-        if callable(add_tool):
-            add_tool(build_medical_copilot_tool(medical, seed_user["id"]))
-
-    def resolve_strategy_evidence(tenant_id: str, proposal_id: str) -> dict[str, Any]:
-        """Resolve P2 evidence only inside the authenticated tenant boundary."""
-
-        services: list[Any] = []
-        evaluation_registry = getattr(app.state, "evaluation_service_registry", None)
-        if evaluation_registry is not None:
-            # The registry database is tenant-scoped.  A read-only service is
-            # sufficient here and avoids binding evidence resolution to any
-            # individual user's Agent runtime.
-            services.append(evaluation_registry.get(tenant_id))
-        elif not auth_required and seed_user is not None and seed_user["tenant_id"] == tenant_id:
-            evaluation_service = getattr(app.state, "evaluation_service", None)
-            if evaluation_service is not None:
-                services.append(evaluation_service)
-        for evaluation_service in services:
-            try:
-                # This call rebuilds the completed runs, immutable dataset,
-                # case results and strategy bindings.  Merely observing an
-                # old ``approved`` status is not sufficient deployment proof.
-                verified = evaluation_service.get_verified_promotion_evidence(
-                    proposal_id
-                )
-                return {
-                    "tenant_id": tenant_id,
-                    **verified,
-                }
-            except LookupError:
-                continue
-        raise LookupError(f"offline promotion proposal not found: {proposal_id}")
-
-    traffic_provenance = os.getenv(
-        "AGI_ONLINE_TRAFFIC_PROVENANCE", "disabled"
-    ).strip().lower()
-    runtime_identity_provider = (
-        (lambda: production_runtime_identity_from_environment(cfg))
-        if traffic_provenance == "production_authenticated"
-        else None
-    )
-    experiment = ExperimentService(
-        ExperimentStore(engine=store.engine),
-        strategy_evidence_resolver=resolve_strategy_evidence,
-        production_evidence_ready=(
-            bool(auth_required) and store.engine.dialect.name != "sqlite"
-        ),
-        baseline_runtime_overrides={
-            "rag": {
-                "top_k": int(getattr(cfg, "top_k", 3)),
-                "no_answer_threshold": float(
-                    getattr(cfg, "rag_no_answer_threshold", 0.0) or 0.0
-                ),
-            }
-        },
-        runtime_identity_provider=runtime_identity_provider,
-        runtime_environment_fingerprint=os.getenv(
-            "AGI_EXPERIMENT_RUNTIME_ENVIRONMENT_FINGERPRINT", ""
-        ),
-    ) if getattr(cfg, "enable_experiments", False) else None
     app.state.application_store = store
     app.state.auth_service = auth
     app.state.skill_service = skills
     app.state.agent_registry = registry
-    app.state.medical_service = medical
-    # _router() 中的 /api/medical/soap 需要用它落库病历文档；
-    # 该函数是本闭包内的定义，路由层只能经 app.state 访问。
-    app.state.write_medical_document = write_medical_document
     app.state.auth_required = bool(auth_required)
     app.state.development_user = seed_user
     app.state.memory_outbox_worker = outbox_worker
-    app.state.experiment_service = experiment
 
     @app.exception_handler(RequestValidationError)
     async def go_auth_request_validation_error(
@@ -318,14 +197,10 @@ def install_application_features(
         return await call_next(request)
 
     app.include_router(_router(cfg))
-    if experiment is not None:
-        app.include_router(create_experiment_router())
     _install_openapi_security(app)
     register_shutdown(app, registry.close)
     if outbox_worker is not None:
         register_shutdown(app, outbox_worker.close)
-    if experiment is not None:
-        register_shutdown(app, experiment.close)
     register_shutdown(app, store.close)
 
 
@@ -461,7 +336,7 @@ def _router(cfg=None) -> APIRouter:
         trace = repo.get(user["id"], trace_id) if repo is not None else None
         if trace is None:
             raise HTTPException(status_code=404, detail="Trace 不存在")
-        return redact_public_experiment_trace(trace)
+        return trace
 
     @router.delete("/api/traces/{trace_id}")
     def traces_delete(trace_id: str, request: Request):
@@ -578,83 +453,6 @@ def _router(cfg=None) -> APIRouter:
         agent = current_agent(request)
         return {"items": [_memory_item(item) for item in agent.ltm.snapshot() if item.status == "superseded"]}
 
-    @router.post("/api/medical/score")
-    def medical_calculate_score(body: MedicalScoreRequest, request: Request):
-        current_user(request)
-        try:
-            return request.app.state.medical_service.calculate_score(body.score_type, body.params)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
-
-    @router.post("/api/medical/safety")
-    def medical_check_safety(body: MedicalSafetyRequest, request: Request):
-        current_user(request)
-        return request.app.state.medical_service.check_safety(
-            drugs=body.drugs,
-            allergies=body.allergies,
-            conditions=body.conditions,
-        )
-
-    @router.post("/api/medical/emergency")
-    def medical_check_emergency(request: Request, query: str = Query(..., min_length=1)):
-        current_user(request)
-        result = request.app.state.medical_service.check_emergency(query)
-        return {"triggered": result is not None, "alert": result}
-
-    @router.post("/api/medical/soap", status_code=201)
-    def medical_soap_create(body: MedicalSoapRequest, request: Request):
-        user = current_user(request)
-        soap_md = request.app.state.medical_service.build_soap_record(
-            body.patient_info,
-            body.subjective,
-            body.objective,
-            body.assessment,
-            body.plan,
-        )
-        doc_id = None
-        if body.save_document:
-            doc_id = request.app.state.write_medical_document(
-                user["id"],
-                title=f"门诊病历-{body.patient_info.get('name', '就诊记录')}-{date.today().isoformat()}",
-                markdown=soap_md,
-                metadata={"type": "medical_soap", "patient": body.patient_info.get("name")},
-            )
-        return {"markdown": soap_md, "document_id": doc_id}
-
-    # 兼容 Go 路线合同存根 (Go wire contract parity stubs)
-    @router.get("/api/farm/template.csv")
-    def farm_template_stub():
-        return Response(content="date,batch_id,type,feed_intake_kg,avg_weight_kg,mortality_count,water_intake_l,temperature_c,humidity_pct,notes\n", media_type="text/csv")
-
-    @router.post("/api/farm/import")
-    def farm_import_stub():
-        return {"imported": 0, "status": "deprecated"}
-
-    @router.get("/api/farm/records")
-    def farm_records_get_stub():
-        return {"records": []}
-
-    @router.post("/api/farm/records")
-    def farm_records_post_stub():
-        return {"status": "ok"}
-
-    @router.get("/api/farm/reports")
-    def farm_reports_get_stub():
-        return {"reports": []}
-
-    @router.post("/api/farm/reports")
-    def farm_reports_post_stub():
-        return {"report_id": "stub"}
-
-    @router.get("/api/farm/reports/{report_id}")
-    def farm_report_by_id_stub(report_id: str):
-        return {"report_id": report_id, "status": "deprecated"}
-
-    # Exclude optional domain routes from both routing and OpenAPI. Their
-    # implementation remains available for explicitly enabled deployments.
-    disabled = tuple(f"/api/{domain}/" for domain in ("medical", "farm")
-                     if not getattr(cfg, f"enable_{domain}", False))
-    router.routes[:] = [route for route in router.routes if not route.path.startswith(disabled)]
     return router
 
 

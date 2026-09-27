@@ -1,19 +1,18 @@
-"""Transactional persistence facade for auth, skills, and smart-farm features."""
+"""Transactional persistence facade for auth and skills."""
 
 from __future__ import annotations
 
 import uuid
 from contextlib import contextmanager
-from datetime import date
 from typing import Any, Iterator
 
-from sqlalchemy import and_, select
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from internal.evaluation.store import EvaluationStore
 
-from .models import FarmProductionRecord, FarmReportRecord, InstalledSkillRecord, UserRecord, utcnow
+from .models import InstalledSkillRecord, UserRecord, utcnow
 
 
 class ConflictError(RuntimeError):
@@ -253,88 +252,6 @@ class ApplicationStore:
             "enabled": record.enabled,
             "installed_at": record.installed_at,
         }
-
-    # -- farm ----------------------------------------------------------------
-    def insert_farm_records(self, user_id: str, records: list[dict[str, Any]]) -> tuple[int, int]:
-        accepted = 0
-        duplicate = 0
-        with self.transaction() as session:
-            for item in records:
-                exists = session.scalar(select(FarmProductionRecord.id).where(
-                    FarmProductionRecord.user_id == user_id,
-                    FarmProductionRecord.source_hash == item["source_hash"],
-                    FarmProductionRecord.source_row == item["source_row"],
-                ))
-                if exists:
-                    duplicate += 1
-                    continue
-                session.add(FarmProductionRecord(user_id=user_id, **item))
-                accepted += 1
-        return accepted, duplicate
-
-    def list_farm_records(
-        self, user_id: str, *, date_from: date | None = None, date_to: date | None = None,
-        farm_name: str = "", stage: str = "", limit: int = 500,
-    ) -> list[dict[str, Any]]:
-        filters = [FarmProductionRecord.user_id == user_id]
-        if date_from:
-            filters.append(FarmProductionRecord.record_date >= date_from)
-        if date_to:
-            filters.append(FarmProductionRecord.record_date <= date_to)
-        if farm_name:
-            filters.append(FarmProductionRecord.farm_name == farm_name)
-        if stage:
-            filters.append(FarmProductionRecord.stage == stage)
-        query = select(FarmProductionRecord).where(and_(*filters)).order_by(
-            FarmProductionRecord.record_date.desc(), FarmProductionRecord.id
-        ).limit(max(1, min(int(limit), 100001)))
-        with self.transaction() as session:
-            return [self._farm_record(record) for record in session.scalars(query).all()]
-
-    def save_farm_report(self, report: dict[str, Any]) -> dict[str, Any]:
-        record = FarmReportRecord(**report)
-        with self.transaction() as session:
-            session.add(record)
-            session.flush()
-        return self._farm_report(record)
-
-    def list_farm_reports(self, user_id: str, limit: int = 50) -> list[dict[str, Any]]:
-        query = select(FarmReportRecord).where(FarmReportRecord.user_id == user_id).order_by(
-            FarmReportRecord.created_at.desc()
-        ).limit(max(1, min(int(limit), 200)))
-        with self.transaction() as session:
-            return [self._farm_report(record) for record in session.scalars(query).all()]
-
-    def get_farm_report(self, user_id: str, report_id: str) -> dict[str, Any]:
-        with self.transaction() as session:
-            record = session.scalar(select(FarmReportRecord).where(
-                FarmReportRecord.user_id == user_id,
-                FarmReportRecord.id == report_id,
-            ))
-            if record is None:
-                raise NotFoundError("报告不存在")
-            return self._farm_report(record)
-
-    @staticmethod
-    def _farm_record(record: FarmProductionRecord) -> dict[str, Any]:
-        return {column.name: getattr(record, column.name) for column in record.__table__.columns if column.name != "user_id"}
-
-    @staticmethod
-    def _farm_report(record: FarmReportRecord) -> dict[str, Any]:
-        return {
-            "id": record.id,
-            "type": record.report_type,
-            "farm_name": record.farm_name,
-            "from": record.date_from,
-            "to": record.date_to,
-            "metrics": record.metrics or [],
-            "anomalies": record.anomalies or [],
-            "data_quality": record.data_quality or {},
-            "markdown": record.markdown,
-            "document_id": record.document_id,
-            "created_at": record.created_at,
-        }
-
 
 _KNOWN_ROLES = frozenset({
     "participant",

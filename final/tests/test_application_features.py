@@ -6,7 +6,6 @@ import pytest
 from fastapi.testclient import TestClient
 
 from internal.application.auth import AuthService, AuthenticationError
-from internal.application.medical import MedicalService
 from internal.application.skills import SkillService
 from internal.application.store import ApplicationStore, NotFoundError
 from internal.application.local_repos import (
@@ -75,21 +74,6 @@ def test_skill_install_toggle_and_tenant_isolation(store: ApplicationStore, monk
     assert skills.installed(alice["user_id"]) == []
     with pytest.raises(NotFoundError):
         skills.uninstall(alice["user_id"], "builtin:weekly_report")
-
-
-def test_medical_service_and_scores(store: ApplicationStore):
-    medical = MedicalService()
-    bmi = medical.calculate_score("bmi", {"height_cm": 180, "weight_kg": 75})
-    assert bmi["value"] == 23.15
-    assert "正常" in bmi["category"]
-
-    safety = medical.check_safety(["华法林", "阿司匹林"])
-    assert safety["is_safe"] is False
-    assert len(safety["interaction_conflicts"]) >= 1
-
-    emergency = medical.check_emergency("突发剧烈压榨性胸痛向左肩放射")
-    assert emergency is not None
-    assert emergency["severity"] == "S0"
 
 
 def test_fastapi_strict_auth_contract(tmp_path: Path, monkeypatch):

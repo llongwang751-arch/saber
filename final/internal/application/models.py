@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import (
     JSON,
     Boolean,
-    Date,
     DateTime,
     Float,
     ForeignKey,
@@ -74,61 +73,6 @@ class InstalledSkillRecord(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow
     )
-
-
-class FarmProductionRecord(Base):
-    __tablename__ = "farm_production_records"
-    __table_args__ = (
-        UniqueConstraint("user_id", "source_hash", "source_row", name="uq_farm_source_row"),
-        Index("ix_farm_records_user_date", "user_id", "record_date"),
-        Index("ix_farm_records_user_farm_stage", "user_id", "farm_name", "stage", "record_date"),
-    )
-
-    id: Mapped[str] = mapped_column(String(40), primary_key=True)
-    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
-    record_date: Mapped[date] = mapped_column(Date, nullable=False)
-    farm_name: Mapped[str] = mapped_column(String(200), nullable=False)
-    barn_name: Mapped[str] = mapped_column(String(200), nullable=False, default="")
-    batch_no: Mapped[str] = mapped_column(String(200), nullable=False, default="")
-    stage: Mapped[str] = mapped_column(String(32), nullable=False)
-    opening_head: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    average_head: Mapped[float] = mapped_column(Float, nullable=False, default=0)
-    transfers_in: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    transfers_out: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    deaths: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    culled: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    total_born: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    live_born: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    weaned: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    feed_kg: Mapped[float] = mapped_column(Float, nullable=False, default=0)
-    weight_gain_kg: Mapped[float] = mapped_column(Float, nullable=False, default=0)
-    scheduled_minutes: Mapped[float] = mapped_column(Float, nullable=False, default=0)
-    downtime_minutes: Mapped[float] = mapped_column(Float, nullable=False, default=0)
-    design_rate_kg_min: Mapped[float] = mapped_column(Float, nullable=False, default=0)
-    actual_output_kg: Mapped[float] = mapped_column(Float, nullable=False, default=0)
-    qualified_output_kg: Mapped[float] = mapped_column(Float, nullable=False, default=0)
-    source_name: Mapped[str] = mapped_column(String(300), nullable=False, default="")
-    source_hash: Mapped[str] = mapped_column(String(64), nullable=False)
-    source_row: Mapped[int] = mapped_column(Integer, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
-
-
-class FarmReportRecord(Base):
-    __tablename__ = "farm_reports"
-    __table_args__ = (Index("ix_farm_reports_user_created", "user_id", "created_at"),)
-
-    id: Mapped[str] = mapped_column(String(40), primary_key=True)
-    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
-    report_type: Mapped[str] = mapped_column(String(32), nullable=False)
-    farm_name: Mapped[str] = mapped_column(String(200), nullable=False, default="")
-    date_from: Mapped[date] = mapped_column(Date, nullable=False)
-    date_to: Mapped[date] = mapped_column(Date, nullable=False)
-    metrics: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
-    anomalies: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
-    data_quality: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
-    markdown: Mapped[str] = mapped_column(Text, nullable=False)
-    document_id: Mapped[str] = mapped_column(String(64), nullable=False, default="")
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
 
 
 class AgentPreferenceRecord(Base):

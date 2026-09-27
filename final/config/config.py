@@ -31,7 +31,7 @@ def _project_root() -> str:
 
 
 _CONFIG_SCHEMA = {
-    "features": {"medical", "farm", "experiments"},
+    "features": set(),
     "research": set(research_config.LIMITS),
     "tools": {"manifest"},
     "llm": {"api_url", "api_key", "model", "fast_model", "temperature"},

@@ -12,7 +12,6 @@ from sqlalchemy.engine import make_url
 
 from internal.evaluation.store import Base
 from internal.application import models as _application_models  # noqa: F401
-from internal.experimentation import models as _experimentation_models  # noqa: F401
 
 
 config = context.config

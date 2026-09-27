@@ -1,6 +1,6 @@
 # AGI Assistant · 新同学启动指南
 
-> **AGI-Saber Research**：新增 DeerFlow 形态的研究工作台，支持持久化计划审批、迭代研究、来源与引用报告。新用户优先阅读 [研究快速开始](docs/research-quickstart.md) 和 [研究运行时架构](docs/research-architecture.md)。使用 `config/conf.example.yaml` 可以仅依赖本地 SQLite 启动；医疗、农场、在线实验默认关闭。以下章节保留完整平台的历史部署说明。
+> **AGI-Saber Research**：新增 DeerFlow 形态的研究工作台，支持持久化计划审批、迭代研究、来源与引用报告。新用户优先阅读 [研究快速开始](docs/research-quickstart.md) 和 [研究运行时架构](docs/research-architecture.md)。使用 `config/conf.example.yaml` 可以仅依赖本地 SQLite 启动。以下章节保留完整平台的历史部署说明。
 
 > 2026-09-13 性能核对：当前 Python `LocalRagChunkRepo.search_local` 是按租户过滤的词法扫描，并未使用 FTS5。本轮改为仅读取文本列、流式计算、有界 TopK，避免解码不用的向量；排序语义及租户隔离保持不变。Mini-Drop 使用独立测试库完成 Linux 同负载对照，详见 [本地检索性能核对](docs/本地检索性能核对-20260913.md)。这些结果不代表完整聊天、远程模型或 Milvus 验收。
 
@@ -72,7 +72,7 @@ INFO:     Uvicorn running on http://0.0.0.0:8090 (Press CTRL+C to quit)
 - 就绪检查：http://localhost:8090/readyz
 - Swagger：http://localhost:8090/docs
 
-> 纯本地模式也不是一次性 mock：用户、技能、门诊记录、文档及版本、聊天、长期记忆、任务快照、RAG 分块和评测结果都会写入 `runtime/` 下的 SQLite。当前仓库在 D 盘时，数据也在 D 盘。Milvus、Elasticsearch、Neo4j、Kafka 和 PostgreSQL 是分布式增强项，连接失败时本地核心链路仍可运行。
+> 纯本地模式也不是一次性 mock：用户、技能、文档及版本、聊天、长期记忆、任务快照、RAG 分块和评测结果都会写入 `runtime/` 下的 SQLite。当前仓库在 D 盘时，数据也在 D 盘。Milvus、Elasticsearch、Neo4j、Kafka 和 PostgreSQL 是分布式增强项，连接失败时本地核心链路仍可运行。
 
 ---
 
@@ -129,7 +129,7 @@ Get-Content .env | Where-Object { $_ -match '^[^#][^=]*=' } | ForEach-Object {
 python main.py
 ```
 
-`AGI_AUTH_REQUIRED` 默认为 `1`。本地模式首次打开页面可注册账号；后续用同一账号登录。文档、记忆、医疗业务数据和技能按账号隔离，评测证据按租户共享并由角色控制，便于创建者与另一名审批人在同一证据上完成双人审核。切换到 `production_authenticated` 后公开注册会自动关闭，必须使用后台预置命令创建业务账号。未设置安全 JWT 密钥时 `/api/status` 会暴露开发密钥告警，不能用于生产环境。
+`AGI_AUTH_REQUIRED` 默认为 `1`。本地模式首次打开页面可注册账号；后续用同一账号登录。文档、记忆和技能按账号隔离，评测证据按租户共享并由角色控制，便于创建者与另一名审批人在同一证据上完成双人审核。切换到 `production_authenticated` 后公开注册会自动关闭，必须使用后台预置命令创建业务账号。未设置安全 JWT 密钥时 `/api/status` 会暴露开发密钥告警，不能用于生产环境。
 
 其它常用环境变量：
 
@@ -229,7 +229,7 @@ final/
 │   └── dist/               # 构建产物（被 / 静态挂载）
 ├── internal/
 │   ├── handler/            # HTTP 路由
-│   ├── application/        # JWT、多用户、技能、养殖业务、本地持久化
+│   ├── application/        # JWT、多用户、技能、本地持久化
 │   ├── evaluation/         # 评测集、适配器、Trace、指标、Badcase 与报告
 │   ├── agent/              # ReAct Agent / Router / Planner
 │   ├── llm/                # LLM 客户端
@@ -328,16 +328,14 @@ HTTP 路由以运行时 OpenAPI 为准；应用数据库当前迁移头为 `0017
 - **结构化 MCP 调用**：保留 payload、原始 JSON、错误码、耗时和 `retryable`；参数错误/HTTP 4xx/取消不重试，网络错误/超时/HTTP 5xx 才按上限重试。
 - **本地知识库**：上传 TXT、Markdown、可提取文字的 PDF，查看版本、重新入库或删除；离线模式也会持久化 RAG 分块，重启后仍能检索。
 - **Skill 广场**：安装、启停、卸载 7 个内置技能；GitHub 搜索只读取仓库元数据，不下载和执行第三方代码。
-- **智慧养殖**：导入 CSV、XLSX，进行年度、月周、日报、断奶、生长和饲料效率分析，支持异常提示及 Markdown 报告落入本地文档库。
 - **记忆治理**：查看隔离、解除隔离、合并/替代后的长期记忆状态。本地 SQLite 在同一数据库事务写权威行与 Outbox，由本地 Worker 更新投影账本；生产 PostgreSQL 在同一事务写 `long_term_memory` 与按 target 拆分的 Outbox，再由带租约、重试、dead-letter 和周期对账的消费者投影到 Milvus/Neo4j。真实外部集群恢复能力仍需完整环境验证。
 - **Agent 评测**：不可变数据集版本、Replay/Local/HTTP Adapter、16 项意图/工具/RAG/记忆/Harness/安全与 Trace 指标、S0/S1 硬门禁、SSE 进度、Badcase、版本回归和报告导出。
 - **离线策略晋级**：候选策略版本、成对统计比较、双人审批、显式激活与回滚；审批证据在使用前重新校验，不能把 Replay 分数冒充线上收益。
-- **真实在线实验**：稳定分桶、曝光与反馈账本、固定停止规则、归因成熟度、分流异常检查（SRM）、安全熔断和审计链；只统计后台预置且符合资格的业务账号。
 - **受控策略演进**：根据 RAG Badcase 生成可解释的参数建议，经另一人审核后才能物化为新的离线候选；不会自动修改线上策略。
 - **运行 Trace**：每次回答生成 `trace_id`，结构化过程脱敏后持久化，并按登录用户隔离查询。
 - **RAG 故障恢复**：远程精排失败可切换本地确定性重排，Embedding/检索依赖独立熔断，ES/Milvus 投影可从主存储重新构建。
 
-所有功能都受 JWT 用户边界保护。演示数据是合成数据，不代表医疗诊断准确率或真实生产吞吐。
+所有功能都受 JWT 用户边界保护。演示数据是合成数据，不代表真实生产吞吐。
 
 ---
 
@@ -346,23 +344,12 @@ HTTP 路由以运行时 OpenAPI 为准；应用数据库当前迁移头为 `0017
 默认数据位于当前 `final/runtime/`：
 
 ```text
-runtime/evaluation.db             账号、技能、文档、记忆、养殖等应用数据
+runtime/evaluation.db             账号、技能、文档、记忆等应用数据
 runtime/evaluation-tenants/       本地开发使用的每租户评测数据库
 runtime/reports/                  Markdown / CSV 报告
 ```
 
 Docker 模式使用 `app_runtime` 数据卷。要迁移数据，先停服务，再整体备份 `runtime/` 或 Docker volume。不要在运行中直接删除 SQLite 文件。
-
-生产实验账号需由后台显式预置；公开注册、开发账号、管理员和审批人均不会计入真实曝光：
-
-```bash
-python scripts/provision_experiment_user.py \
-  --username farm_operator --tenant-id farm-a --create --experiment-eligible
-```
-
-命令会交互读取密码，不接受命令行密码，也不会输出密码或哈希。已有旧账号默认标记为 `legacy_unverified`，必须经过同一命令重新归属租户并明确授予实验资格。
-
-生产在线实验还必须由构建/发布流水线生成只读的运行环境组件清单，并通过部署控制器单独注入清单摘要。旧变量 `AGI_EXPERIMENT_RUNTIME_ENVIRONMENT_FINGERPRINT` 仅保留兼容用途，手填任意 64 位十六进制字符串不能通过生产证据就绪检查。完整步骤见[生产运行环境组件清单与可信指纹](./docs/P3-运行环境组件清单与可信指纹.md)。
 
 ---
 
