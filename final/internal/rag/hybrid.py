@@ -123,6 +123,7 @@ class HybridStore:
         document_id: str = "",
         version_id: str = "",
         section: str = "",
+        chunk_start: int = 0,
     ) -> List[int]:
         """把 PG / ES / Milvus / KG 写入收敛到 HybridStore。
 
@@ -134,20 +135,29 @@ class HybridStore:
         valid_embeddings: List[List[float]] = []
         valid_chunk_idxs: List[int] = []
 
+        if callable(getattr(self.inf.repo.ragchunk, "save_many_with_parents", None)):
+            saved_ids = self._repo_call(
+                "save_many_with_parents", doc_hash, contents, parents,
+                [json.dumps(value) for value in embeddings],
+                document_id=document_id, version_id=version_id, section=section,
+                start_index=chunk_start,
+            )
+            if len(saved_ids) != len(contents):
+                raise RuntimeError("RAG batch did not return one ID per chunk")
+        else:
+            saved_ids = []
+            for idx, content in enumerate(contents):
+                embedding = embeddings[idx] if idx < len(embeddings) else []
+                parent_content = parents[idx] if idx < len(parents) else ""
+                saved_ids.append(self._repo_call(
+                    "save_pg_with_parent", doc_hash, chunk_start + idx, content, parent_content,
+                    json.dumps(embedding), document_id=document_id,
+                    version_id=version_id, section=section,
+                ))
+
         for idx, content in enumerate(contents):
             embedding = embeddings[idx] if idx < len(embeddings) else []
-            parent_content = parents[idx] if idx < len(parents) else ""
-            pg_id = self._repo_call(
-                "save_pg_with_parent",
-                doc_hash,
-                idx,
-                content,
-                parent_content,
-                json.dumps(embedding),
-                document_id=document_id,
-                version_id=version_id,
-                section=section,
-            )
+            pg_id = saved_ids[idx]
             if pg_id <= 0:
                 continue
             pg_ids.append(pg_id)
@@ -158,9 +168,9 @@ class HybridStore:
                 self._write_index_with_retry(
                     "elasticsearch",
                     lambda pg_id=pg_id, content=content, idx=idx: self._repo_call(
-                        "index_es", pg_id, content, doc_hash, idx
+                        "index_es", pg_id, content, doc_hash, chunk_start + idx
                     ),
-                    {"pg_id": pg_id, "doc_hash": doc_hash, "chunk_idx": idx},
+                    {"pg_id": pg_id, "doc_hash": doc_hash, "chunk_idx": chunk_start + idx},
                 )
 
         milvus_ids: List[int] = []
@@ -183,7 +193,7 @@ class HybridStore:
 
         if self._kg is not None and self._kg.available() and pg_ids:
             refs = [
-                ChunkRef(id=idx, pg_id=pg_id, content=content)
+                ChunkRef(id=chunk_start + idx, pg_id=pg_id, content=content)
                 for idx, pg_id, content in zip(valid_chunk_idxs, pg_ids, valid_contents)
             ]
             threading.Thread(
@@ -193,9 +203,7 @@ class HybridStore:
                 daemon=True,
             ).start()
 
-        if getattr(self.cfg, 'rag_lightweight_enabled', False):
-            # Explicit ingestion is retryable through reindex. Query paths do
-            # not silently spend model calls to repair missing projections.
+        if getattr(self.cfg, "rag_lightweight_enabled", False):
             self.rebuild_lightweight(dict(zip(pg_ids, valid_embeddings)))
         return pg_ids
 

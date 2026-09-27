@@ -94,7 +94,9 @@ def wire_client(tmp_path, monkeypatch):
     monkeypatch.setenv(
         "AGI_EVAL_DATABASE_URL", f"sqlite+pysqlite:///{database.as_posix()}"
     )
-    app = setup_routes(_Agent(), _Infra(), APIConfig(), auth_required=True)
+    cfg = APIConfig()
+    cfg.enable_farm = True  # Historical route compatibility is an opt-in profile.
+    app = setup_routes(_Agent(), _Infra(), cfg, auth_required=True)
     with TestClient(app) as client:
         yield client
 

@@ -1072,30 +1072,80 @@ class LocalRagChunkRepo:
             record.section = section or record.section or ""
             session.flush()
             self._enqueue_upserts(session, record)
-            try:
-                _ensure_fts5_table(session)
-                from internal.rag.fts5_index import fts_tokenize
-                session.execute(
-                    text("DELETE FROM agent_rag_chunks_fts WHERE pg_id = :pg_id AND user_id = :user_id"),
-                    {"pg_id": str(record.id), "user_id": str(user_id)}
-                )
-                session.execute(
-                    text("""
-                        INSERT INTO agent_rag_chunks_fts (pg_id, user_id, doc_hash, content, parent_content, search_text)
-                        VALUES (:pg_id, :user_id, :doc_hash, :content, :parent_content, :search_text)
-                    """),
-                    {
-                        "pg_id": str(record.id),
-                        "user_id": str(user_id),
-                        "doc_hash": str(doc_hash),
-                        "content": content,
-                        "parent_content": parent_content or "",
-                        "search_text": fts_tokenize(f"{content}\n{parent_content}"),
-                    }
-                )
-            except Exception:
-                pass
+            self._update_fts(session, record)
             return int(record.id)
+
+    @staticmethod
+    def _update_fts(session, record):
+        try:
+            _ensure_fts5_table(session)
+            from internal.rag.fts5_index import fts_tokenize
+            session.execute(
+                text("DELETE FROM agent_rag_chunks_fts WHERE pg_id = :pg_id AND user_id = :user_id"),
+                {"pg_id": str(record.id), "user_id": str(record.user_id)}
+            )
+            session.execute(
+                text("""
+                    INSERT INTO agent_rag_chunks_fts (pg_id, user_id, doc_hash, content, parent_content, search_text)
+                    VALUES (:pg_id, :user_id, :doc_hash, :content, :parent_content, :search_text)
+                """),
+                {
+                    "pg_id": str(record.id),
+                    "user_id": str(record.user_id),
+                    "doc_hash": str(record.doc_hash),
+                    "content": record.content,
+                    "parent_content": record.parent_content or "",
+                    "search_text": fts_tokenize(f"{record.content}\n{record.parent_content}"),
+                }
+            )
+        except Exception:
+            pass
+
+    def save_many_with_parents(
+        self,
+        doc_hash: str,
+        contents: list[str],
+        parents: list[str],
+        embedding_jsons: list[str],
+        *,
+        user_id: str = "default_user",
+        document_id: str = "",
+        version_id: str = "",
+        section: str = "",
+        start_index: int = 0,
+    ) -> list[int]:
+        """Persist long documents in bounded transactions instead of one commit per chunk."""
+        if len(contents) != len(parents) or len(contents) != len(embedding_jsons):
+            raise ValueError("RAG batch fields have different lengths")
+        ids: list[int] = []
+        for start in range(0, len(contents), 100):
+            with self.store.transaction() as session:
+                for idx in range(start, min(start + 100, len(contents))):
+                    record = session.scalar(
+                        select(AgentRagChunkRecord).where(
+                            AgentRagChunkRecord.user_id == user_id,
+                            AgentRagChunkRecord.doc_hash == doc_hash,
+                            AgentRagChunkRecord.chunk_idx == start_index + idx,
+                        )
+                    )
+                    if record is None:
+                        record = AgentRagChunkRecord(
+                            user_id=user_id, doc_hash=doc_hash,
+                            chunk_idx=start_index + idx, content=contents[idx],
+                        )
+                        session.add(record)
+                    record.content = contents[idx]
+                    record.parent_content = parents[idx] or ""
+                    record.embedding = [float(value) for value in _json_list(embedding_jsons[idx])]
+                    record.document_id = document_id or record.document_id or ""
+                    record.version_id = version_id or record.version_id or ""
+                    record.section = section or record.section or ""
+                    session.flush()
+                    self._enqueue_upserts(session, record)
+                    self._update_fts(session, record)
+                    ids.append(int(record.id))
+        return ids
+
 
     @staticmethod
     def _enqueue_upserts(session, record: AgentRagChunkRecord) -> None:

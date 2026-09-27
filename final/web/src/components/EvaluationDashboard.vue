@@ -31,11 +31,11 @@
       <nav class="eval-workspace-tabs" aria-label="评测工作区">
         <button type="button" :class="{ active: workspaceMode === 'offline' }" :aria-pressed="workspaceMode === 'offline'"
                 @click="setWorkspaceMode('offline')">离线评测</button>
-        <button type="button" :class="{ active: workspaceMode === 'online' }" :aria-pressed="workspaceMode === 'online'"
+        <button v-if="experimentsEnabled" type="button" :class="{ active: workspaceMode === 'online' }" :aria-pressed="workspaceMode === 'online'"
                 @click="setWorkspaceMode('online')">真实在线实验</button>
       </nav>
 
-      <OnlineExperimentPanel v-if="workspaceMode === 'online'" />
+      <OnlineExperimentPanel v-if="experimentsEnabled && workspaceMode === 'online'" />
 
       <div v-else class="offline-workspace">
       <div class="eval-mode-summary">
@@ -359,6 +359,7 @@ import EvolutionSuggestionPanel from './EvolutionSuggestionPanel.vue'
 import OnlineExperimentPanel from './OnlineExperimentPanel.vue'
 
 const emit = defineEmits(['close'])
+defineProps({ experimentsEnabled: { type: Boolean, default: false } })
 const evaluation = useEvaluation()
 const auth = useAuth()
 const workspaceMode = ref('offline')

@@ -71,10 +71,16 @@ def run_migrations_online() -> None:
     if connectable.dialect.name == "sqlite":
 
         @event.listens_for(connectable, "connect")
-        def _enable_sqlite_foreign_keys(dbapi_connection, _connection_record) -> None:
+        def _prepare_sqlite_batch_migration(dbapi_connection, _connection_record) -> None:
             cursor = dbapi_connection.cursor()
             try:
-                cursor.execute("PRAGMA foreign_keys=ON")
+                # Alembic batch operations DROP and recreate parent tables.
+                # Enforcing ON DELETE CASCADE here deletes unrelated child
+                # data when e.g. users gains columns. This dedicated migration
+                # connection has no application writes; runtime connections
+                # still enforce foreign_keys=ON in evaluation.store.
+                cursor.execute("PRAGMA foreign_keys=OFF")
+                cursor.execute("PRAGMA busy_timeout=5000")
             finally:
                 cursor.close()
 
@@ -90,6 +96,10 @@ def run_migrations_online() -> None:
 
         with context.begin_transaction():
             context.run_migrations()
+            if connection.dialect.name == "sqlite":
+                if connection.exec_driver_sql("PRAGMA foreign_key_check").first() is not None:
+                    raise RuntimeError("Migration left invalid foreign-key references")
+    connectable.dispose()
 
 
 if context.is_offline_mode():

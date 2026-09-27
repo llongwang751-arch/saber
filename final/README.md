@@ -1,5 +1,7 @@
 # AGI Assistant · 新同学启动指南
 
+> **AGI-Saber Research**：新增 DeerFlow 形态的研究工作台，支持持久化计划审批、迭代研究、来源与引用报告。新用户优先阅读 [研究快速开始](docs/research-quickstart.md) 和 [研究运行时架构](docs/research-architecture.md)。使用 `config/conf.example.yaml` 可以仅依赖本地 SQLite 启动；医疗、农场、在线实验默认关闭。以下章节保留完整平台的历史部署说明。
+
 > 2026-09-13 性能核对：当前 Python `LocalRagChunkRepo.search_local` 是按租户过滤的词法扫描，并未使用 FTS5。本轮改为仅读取文本列、流式计算、有界 TopK，避免解码不用的向量；排序语义及租户隔离保持不变。Mini-Drop 使用独立测试库完成 Linux 同负载对照，详见 [本地检索性能核对](docs/本地检索性能核对-20260913.md)。这些结果不代表完整聊天、远程模型或 Milvus 验收。
 
 一份"从 git clone 到看到首页"的最短路径。读完按步骤操作即可启动。
@@ -7,6 +9,7 @@
 > 项目位置：本仓库的 `python` 分支，代码在 `final/` 目录下。
 > 后端：FastAPI + Uvicorn（端口 **8090**）；前端：Vue 3 + Pinia + Vite，构建后由后端静态挂载在 `/`。
 > Go/Python 复刻边界、源码映射和面试讲法见 `docs/Go-Python完全复刻对照与面试说明.md`。
+> Agent 分层、应用装配、统一运行账本及验收方式见 [Agent 运行时重构](docs/原生Agent运行时重构.md)；借鉴 DeerFlow 的工程组织方式，运行不依赖 DeerFlow 服务。
 
 ---
 

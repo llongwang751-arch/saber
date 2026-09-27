@@ -1,6 +1,7 @@
 # rag — 检索增强生成（RAG）：Milvus 语义 + ES BM25 + Neo4j 图 + 三路 RRF 融合
 import hashlib
 import inspect
+import os
 import json
 import logging
 import math
@@ -138,14 +139,64 @@ class Engine:
 
         doc_hash = hashlib.sha256(doc.encode("utf-8")).hexdigest()[:16]
         contents = [chunk.content for chunk in chunks]
-        embeddings: List[List[float]] = []
-        for i, chunk in enumerate(chunks):
-            embedding: List[float] = []
-            try:
-                embedding = self._llm.embed(chunk.content)
-            except Exception as e:
-                logger.warning("⚠️  RAG chunk 向量化失败，跳过 Milvus 写入 (idx=%d): %s", i, e)
-            embeddings.append(embedding)
+        embed_batch = getattr(self._llm, "embed_batch", None)
+        if self._hybrid is not None and callable(embed_batch):
+            # Keep at most one batch of 1024-dimensional vectors in Python
+            # memory. A million-character document contains thousands of
+            # chunks and retaining every embedding exceeds the service limit.
+            batch_size = max(1, min(64, int(os.getenv("AGI_EMBEDDING_BATCH_SIZE", "32"))))
+            for start in range(0, len(chunks), batch_size):
+                end = min(len(chunks), start + batch_size)
+                vectors: List[List[float]] = [[] for _ in range(end - start)]
+                try:
+                    batch = embed_batch(contents[start:end])
+                    if len(batch) != end - start:
+                        raise RuntimeError(
+                            f"embedding batch size mismatch: expected={end - start}, actual={len(batch)}"
+                        )
+                    vectors = batch
+                except Exception as e:
+                    logger.warning(
+                        "⚠️  RAG 批量向量化失败，当前批次降级为关键词索引 (range=%d:%d): %s",
+                        start, end, e,
+                    )
+                self._hybrid.index_with_parents(
+                    doc_hash, contents[start:end], child_parents[start:end], vectors,
+                    document_id=document_id, version_id=version_id,
+                    section=section, chunk_start=start,
+                )
+            self.loaded = True
+            self.inf.repo.events.publish("rag.ingest", json.dumps({
+                "chunk_count": len(chunks), "parent_count": len(parents), "doc_hash": doc_hash,
+            }))
+            return len(chunks)
+
+        embeddings: List[List[float]] = [[] for _ in chunks]
+        if callable(embed_batch):
+            batch_size = max(1, min(256, int(os.getenv("AGI_EMBEDDING_BATCH_SIZE", "64"))))
+            for start in range(0, len(chunks), batch_size):
+                end = min(len(chunks), start + batch_size)
+                try:
+                    batch = embed_batch([chunk.content for chunk in chunks[start:end]])
+                    if len(batch) != end - start:
+                        raise RuntimeError(
+                            f"embedding batch size mismatch: expected={end - start}, actual={len(batch)}"
+                        )
+                    embeddings[start:end] = batch
+                except Exception as e:
+                    logger.warning(
+                        "⚠️  RAG 批量向量化失败，当前批次降级为关键词索引 (range=%d:%d): %s",
+                        start,
+                        end,
+                        e,
+                    )
+        else:
+            # 兼容测试替身及只实现单条 embed 的自定义客户端。
+            for i, chunk in enumerate(chunks):
+                try:
+                    embeddings[i] = self._llm.embed(chunk.content)
+                except Exception as e:
+                    logger.warning("⚠️  RAG chunk 向量化失败，跳过 Milvus 写入 (idx=%d): %s", i, e)
 
         if self._hybrid is not None:
             pg_ids = self._hybrid.index_with_parents(
@@ -163,8 +214,14 @@ class Engine:
                 parent_content = child_parents[i] if i < len(child_parents) else ""
                 pg_id = self._repo_call(
                     "save_pg_with_parent",
-                    doc_hash, i, chunk.content, parent_content,
+                    doc_hash,
+                    i,
+                    chunk.content,
+                    parent_content,
                     json.dumps(embeddings[i] if i < len(embeddings) else []),
+                    document_id=document_id,
+                    version_id=version_id,
+                    section=section,
                 )
                 if pg_id > 0:
                     pg_ids.append(pg_id)

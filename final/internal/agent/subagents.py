@@ -51,6 +51,8 @@ def register_builtin_subagents(agent) -> SubAgentRegistry:
         DocAgent(agent),
     ):
         registry.register(subagent)
+    if getattr(getattr(agent, "cfg", None), "enable_medical", False):
+        register_medical_subagents(agent, registry)
     return registry
 
 

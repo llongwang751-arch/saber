@@ -1,6 +1,8 @@
 
 # AGI-assistant：多模态智能体系统
 
+> Python 版现已加入 **AGI-Saber Research**：计划审核 → 迭代研究 → 引用报告，保留原生持久化运行时与 Vue 3。先看 [研究快速开始](final/docs/research-quickstart.md)；[架构与迁移边界](final/docs/research-architecture.md) 说明新旧链路如何共存。医疗、农场、在线实验为显式启用的扩展功能。
+
 AGI-assistant 是一个面向个人与企业的多模态智能体系统，融合了检索增强生成（RAG）、三层记忆、知识图谱、沙箱执行与可恢复执行流，支持多轮对话、知识检索、工具调用与复杂推理。系统具备高可用性、可扩展性与工程落地能力。
 
 > 当前分支是 Python/FastAPI 实现，运行目录为 `final/`。快速启动见 [final/README.md](./final/README.md)，架构见 [系统架构与核心流程图](./final/docs/系统架构与核心流程图.md)，完整截图手册见 [全功能跑通与面试演示指南](./final/docs/全功能跑通与面试演示指南.md)，岗位讲解见 [腾讯医疗 AI Agent 质量评测面试准备](./final/docs/腾讯医疗AI-Agent质量评测面试准备.md)。Go 原版仍保留在 `main` 分支，二者互不覆盖。

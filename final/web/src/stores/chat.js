@@ -48,6 +48,7 @@ export const useChat = defineStore('chat', {
     },
     handleEvent(ai, evt, data) {
       switch (evt) {
+        case 'start': ai.runId = data.run_id || ''; break
         case 'route': ai.mode = data.mode || 'chat'; break
         case 'memory': ai.memory = data.extracted_info || ''; break
         case 'sandbox_ready': ai.sandbox = data.workspace || ''; break

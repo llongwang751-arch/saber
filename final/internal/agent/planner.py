@@ -334,6 +334,9 @@ def needs_subagent_plan(query: str) -> bool:
     """Whether the query asks for a composed research deliverable."""
 
     value = (query or "").lower()
+    # Organization/role names are not requests to conduct research. Otherwise
+    # a factual question containing "研究院" incorrectly launches the report DAG.
+    value = re.sub(r"研究(?:院|所|中心|机构|员|生)", "", value)
     return any(
         keyword in value
         for keyword in ("研究", "调研", "总结", "报告", "文档", "方案", "分析")

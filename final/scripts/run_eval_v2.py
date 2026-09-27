@@ -15,12 +15,10 @@ from __future__ import annotations
 
 import json
 import math
-import re
 import sys
 import time
 from pathlib import Path
-from types import SimpleNamespace
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
 import openpyxl
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
@@ -33,13 +31,10 @@ if str(PROJECT_ROOT) not in sys.path:
 # 引入本地升级后的新核心组件
 from internal.agent.router import detect_tool, need_react, need_tool
 from internal.harness.guardrails import _INJECTION_PATTERNS, sanitize_pii
-from internal.memory.conflict_resolver import MemoryAction, MemoryConflictResolver, VersionedMemoryFact
+from internal.memory.conflict_resolver import MemoryConflictResolver, VersionedMemoryFact
 from internal.memory.fast_vector_index import FastVectorIndex
-from internal.memory.memory import Preference, ShortTerm
 from internal.memory.slot_extractor import SlotExtractor
-from internal.rag.fts5_index import build_fts_query, fts_tokenize
 from internal.rag.local_reranker import LocalOverlapReranker
-from internal.rag.parent_child_splitter import ParentChildSplitter
 from internal.tools.tools import default_tools
 
 DATASET_PATH = PROJECT_ROOT / "evaluation_datasets" / "eval_dataset_v2.json"
@@ -87,7 +82,6 @@ def evaluate_rag(cases: List[Dict[str, Any]]) -> Dict[str, Any]:
     else:
         reranker = LocalOverlapReranker()
 
-    pc_splitter = ParentChildSplitter(parent_chunk_size=400, child_chunk_size=100)
     case_results: List[Dict[str, Any]] = []
 
     metrics = {

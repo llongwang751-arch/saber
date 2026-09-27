@@ -5,6 +5,7 @@
 # (connect / schema bootstrap / health) 与跨域装配 self.repo 仓储入口。
 import json
 import logging
+import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -727,16 +728,23 @@ class Infrastructure:
             logger.warning("⚠️  pymilvus 未安装，Milvus 不可用")
             self.ready.milvus = "memory-mode"
             return
-        if not self.cfg.milvus_host or not self.cfg.milvus_port:
+        lite_path = os.getenv("AGI_MILVUS_LITE_PATH", "").strip()
+        if not lite_path and (not self.cfg.milvus_host or not self.cfg.milvus_port):
             logger.warning("⚠️  Milvus 未配置")
             self.ready.milvus = "memory-mode"
             return
         try:
-            uri = f"http://{self.cfg.milvus_host}:{self.cfg.milvus_port}"
+            if lite_path:
+                from pathlib import Path
+                database = Path(lite_path).expanduser().resolve()
+                database.parent.mkdir(parents=True, exist_ok=True)
+                uri = str(database)
+            else:
+                uri = f"http://{self.cfg.milvus_host}:{self.cfg.milvus_port}"
             self._milvus = MilvusClient(uri=uri)
+            self._init_milvus_collections()
             self.ready.milvus = "connected"
             logger.info("✅ Milvus 已连接: %s", uri)
-            self._init_milvus_collections()
         except Exception as e:
             logger.warning("⚠️  Milvus 连接失败: %s (降级到内存模式)", e)
             self._milvus = None
@@ -843,10 +851,12 @@ class Infrastructure:
             if self._milvus.has_collection(RAG_COLLECTION):
                 # 集合已存在：仅校验 schema，不一致只 warning，不删用户数据
                 self._verify_milvus_rag_schema(RAG_COLLECTION, dim)
-                return
-            self._create_milvus_rag_collection(RAG_COLLECTION, dim)
+            else:
+                self._create_milvus_rag_collection(RAG_COLLECTION, dim)
+            self._milvus.load_collection(collection_name=RAG_COLLECTION)
         except Exception as e:
             logger.warning("⚠️  Milvus 创建集合失败: %s", e)
+            raise
 
     def _create_milvus_rag_collection(self, collection_name: str, dim: int):
         """以显式 schema 创建 RAG 集合：pg_id / content / user_id / embedding。

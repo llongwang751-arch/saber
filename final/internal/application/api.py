@@ -192,9 +192,10 @@ def install_application_features(
         document = (result or {}).get("document") or {}
         return str(document.get("id") or "")
 
-    medical = MedicalService(document_writer=write_medical_document)
-    medical_holder["service"] = medical
-    if seed_user is not None:
+    medical = MedicalService(document_writer=write_medical_document) if getattr(cfg, "enable_medical", False) else None
+    if medical is not None:
+        medical_holder["service"] = medical
+    if seed_user is not None and medical is not None:
         add_tool = getattr(seed_agent, "add_tool", None)
         if callable(add_tool):
             add_tool(build_medical_copilot_tool(medical, seed_user["id"]))
@@ -255,7 +256,7 @@ def install_application_features(
         runtime_environment_fingerprint=os.getenv(
             "AGI_EXPERIMENT_RUNTIME_ENVIRONMENT_FINGERPRINT", ""
         ),
-    )
+    ) if getattr(cfg, "enable_experiments", False) else None
     app.state.application_store = store
     app.state.auth_service = auth
     app.state.skill_service = skills
@@ -316,13 +317,15 @@ def install_application_features(
         request.state.user = user
         return await call_next(request)
 
-    app.include_router(_router())
-    app.include_router(create_experiment_router())
+    app.include_router(_router(cfg))
+    if experiment is not None:
+        app.include_router(create_experiment_router())
     _install_openapi_security(app)
     register_shutdown(app, registry.close)
     if outbox_worker is not None:
         register_shutdown(app, outbox_worker.close)
-    register_shutdown(app, experiment.close)
+    if experiment is not None:
+        register_shutdown(app, experiment.close)
     register_shutdown(app, store.close)
 
 
@@ -406,7 +409,7 @@ def _ensure_development_user(
             )
 
 
-def _router() -> APIRouter:
+def _router(cfg=None) -> APIRouter:
     router = APIRouter(tags=["application"])
 
     @router.post("/api/auth/register")
@@ -647,6 +650,11 @@ def _router() -> APIRouter:
     def farm_report_by_id_stub(report_id: str):
         return {"report_id": report_id, "status": "deprecated"}
 
+    # Exclude optional domain routes from both routing and OpenAPI. Their
+    # implementation remains available for explicitly enabled deployments.
+    disabled = tuple(f"/api/{domain}/" for domain in ("medical", "farm")
+                     if not getattr(cfg, f"enable_{domain}", False))
+    router.routes[:] = [route for route in router.routes if not route.path.startswith(disabled)]
     return router
 
 

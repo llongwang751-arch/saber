@@ -1,0 +1,21 @@
+# Minimal research application. Existing docker-compose.yml remains the full stack.
+services:
+  research:
+    build: .
+    ports:
+      - "127.0.0.1:8090:8090"
+    environment:
+      AGI_CONFIG: /app/config/conf.example.yaml
+      AGI_AUTH_REQUIRED: "1"
+      AGI_JWT_SECRET: ${AGI_JWT_SECRET:?Set a private JWT secret of at least 32 bytes}
+      AGI_LLM_API_URL: ${AGI_LLM_API_URL:?Set the complete chat completions URL}
+      AGI_LLM_API_KEY: ${AGI_LLM_API_KEY:-}
+      AGI_LLM_MODEL: ${AGI_LLM_MODEL:?Set the model ID}
+      TAVILY_API_KEY: ${TAVILY_API_KEY:-}
+      AGI_EVAL_DATABASE_URL: sqlite:////app/runtime/application.db
+      AGI_RUN_DB_PATH: /app/runtime/agent_runs.sqlite3
+    volumes:
+      - research-data:/app/runtime
+    restart: unless-stopped
+volumes:
+  research-data:

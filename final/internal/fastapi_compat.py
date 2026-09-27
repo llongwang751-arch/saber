@@ -17,14 +17,16 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def app_lifespan(app):
-    yield
-    for callback in list(getattr(app.state, "shutdown_callbacks", [])):
-        try:
-            result = callback()
-            if inspect.isawaitable(result):
-                await result
-        except Exception as e:
-            logger.warning("⚠️  shutdown 回调失败: %s", e)
+    try:
+        yield
+    finally:
+        for callback in list(getattr(app.state, "shutdown_callbacks", [])):
+            try:
+                result = callback()
+                if inspect.isawaitable(result):
+                    await result
+            except Exception as e:
+                logger.warning("⚠️  shutdown 回调失败: %s", e)
 
 
 def register_shutdown(app, callback: Callable[[], Any]) -> None:

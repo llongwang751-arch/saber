@@ -5,6 +5,7 @@ import re
 from typing import Any, Dict, List, Optional
 
 import yaml
+from . import research as research_config
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +31,9 @@ def _project_root() -> str:
 
 
 _CONFIG_SCHEMA = {
+    "features": {"medical", "farm", "experiments"},
+    "research": set(research_config.LIMITS),
+    "tools": {"manifest"},
     "llm": {"api_url", "api_key", "model", "fast_model", "temperature"},
     "embedding": {
         "api_url",
@@ -46,6 +50,7 @@ _CONFIG_SCHEMA = {
     "kafka": {"brokers", "topic"},
     "neo4j": {"uri", "user", "password", "max_hops", "weight", "enabled"},
     "rag": {
+        "profile",
         "chunk_size",
         "chunk_overlap",
         "top_k",
@@ -131,6 +136,7 @@ class APIConfig:
     """整合 Python 版主干能力的运行配置（字段名与 Go 版 APIConfig 对齐）。"""
 
     def __init__(self):
+        research_config.initialize(self)
         self.rag_lightweight_enabled = False
         self.rag_lightweight_path = os.path.join(_project_root(), 'runtime', 'retrieval')
         # ---- LLM / Embedding ----
@@ -330,6 +336,7 @@ def _resolve_config_path(explicit: Optional[str]) -> str:
         candidates.append(env)
     root = _project_root()
     candidates.append(os.path.join(root, "config", "config.local.yaml"))
+    candidates.append(os.path.join(root, "config", "conf.yaml"))
     candidates.append(os.path.join(root, "config", "config.yaml"))
     candidates.append("config/config.yaml")
     for p in candidates:
@@ -395,6 +402,10 @@ def default_config(config_path: Optional[str] = None) -> APIConfig:
         c.kg_enabled = bool(neo4j.get("enabled", False))
 
     if rag := data.get("rag"):
+        if "profile" in rag:
+            if rag["profile"] not in {"local", "lightweight", "full"}:
+                raise ValueError("rag.profile must be local, lightweight or full")
+            c.rag_lightweight_enabled = rag["profile"] == "lightweight"
         c.chunk_size = rag.get("chunk_size", 200)
         c.chunk_overlap = rag.get("chunk_overlap", 50)
         c.top_k = rag.get("top_k", 3)
@@ -501,18 +512,25 @@ def default_config(config_path: Optional[str] = None) -> APIConfig:
         c.skillhub_cache_ttl_min = hub.get("cache_ttl_min", 30)
 
     _apply_environment_overrides(c)
+    research_config.configure(c, data)
+    if c.tools_manifest and not os.path.isabs(c.tools_manifest):
+        c.tools_manifest = os.path.join(os.path.dirname(os.path.abspath(path)), c.tools_manifest)
     _apply_defaults(c)
     return c
 
 
 def _apply_environment_overrides(c: APIConfig) -> None:
-    c.rag_lightweight_enabled = os.getenv('AGI_RAG_LIGHTWEIGHT', '0').lower() in {'1', 'true', 'yes'}
+    if 'AGI_RAG_LIGHTWEIGHT' in os.environ:
+        c.rag_lightweight_enabled = research_config.boolean(os.environ['AGI_RAG_LIGHTWEIGHT'], 'AGI_RAG_LIGHTWEIGHT')
     c.rag_lightweight_path = os.getenv('AGI_RAG_INDEX_DIR', c.rag_lightweight_path)
     env_map = {
         "AGI_LLM_API_URL": "llm_api_url",
         "AGI_LLM_API_KEY": "llm_api_key",
         "AGI_LLM_MODEL": "llm_model",
         "AGI_LLM_FAST_MODEL": "llm_fast_model",
+        "TAVILY_API_KEY": "search_api_key",
+        "AGI_SEARCH_API_KEY": "search_api_key",
+        "AGI_SEARCH_API_URL": "search_api_url",
         "AGI_EMBEDDING_API_URL": "embedding_api_url",
         "AGI_EMBEDDING_API_KEY": "embedding_api_key",
         "AGI_EMBEDDING_MODEL": "embedding_model",
@@ -522,6 +540,11 @@ def _apply_environment_overrides(c: APIConfig) -> None:
         "AGI_JWT_SECRET": "auth_jwt_secret",
         "AGI_JWT_TTL_HOURS": "auth_jwt_ttl_hours",
         "AGI_JWT_ISSUER": "auth_jwt_issuer",
+        "AGI_ES_USERNAME": "es_username",
+        "AGI_ES_PASSWORD": "es_password",
+        "AGI_NEO4J_URI": "neo4j_uri",
+        "AGI_NEO4J_USER": "neo4j_user",
+        "AGI_NEO4J_PASSWORD": "neo4j_password",
         "PPROF_ADMIN_TOKEN": "pprof_admin_token",
         "GITHUB_TOKEN": "skillhub_github_token",
     }
@@ -536,6 +559,11 @@ def _apply_environment_overrides(c: APIConfig) -> None:
                     logger.warning("环境变量 %s 不是合法整数，已忽略: %s", env_k, v)
                     continue
             setattr(c, attr_k, raw)
+
+    if addresses := os.getenv("AGI_ES_ADDRESSES"):
+        c.es_addresses = [address.strip() for address in addresses.split(",") if address.strip()]
+    if enabled := os.getenv("AGI_KG_ENABLED"):
+        c.kg_enabled = enabled.strip().lower() in {"1", "true", "yes", "on"}
 
     if env_comp := os.getenv("AGI_ENABLE_CONTEXT_COMPACTOR"):
         c.enable_context_compactor = env_comp.strip().lower() in {"1", "true", "yes", "on"}

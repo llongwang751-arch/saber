@@ -410,6 +410,7 @@ body {
 
 /* ── Controls bar ── */
 .controls-bar {
+  flex-wrap: wrap;
   background: var(--card);
   backdrop-filter: blur(16px);
   -webkit-backdrop-filter: blur(16px);
@@ -1014,3 +1015,31 @@ body {
   user-select: none;
 }
 .hint-chip:hover { border-color: var(--pink); color: var(--pink-d); background: rgba(244,63,94,0.06); box-shadow: var(--shadow-soft); }
+
+/* Keep navigation available without squeezing chat below the viewport width. */
+.mobile-navigation { display: none; }
+@media (max-width: 720px) {
+  body { height: 100dvh; }
+  .main { width: 100%; min-height: 0; }
+  .mobile-navigation {
+    display: block; height: 54px; flex-shrink: 0; text-align: left;
+    padding: 0 16px; border: 0; border-bottom: 1px solid var(--border);
+    background: var(--card-solid); color: var(--primary-d); font: inherit;
+    font-weight: 600; cursor: pointer;
+  }
+  .sidebar { display: none; }
+  .sidebar.mobile-open {
+    display: flex; position: fixed; inset: 54px 0 0; width: 100%; min-width: 0;
+    z-index: 110; overflow-y: auto; background: var(--card-solid);
+  }
+  .sidebar.mobile-open > * { flex-shrink: 0; }
+  .controls-bar { padding: 8px 12px; gap: 8px; }
+  .controls-bar .tools-btn, .controls-bar .rag-toggle-wrap { min-height: 44px; }
+  .controls-right { width: 100%; }
+  .messages { padding: 14px 12px; }
+  .msg-body { max-width: 88%; }
+  .input-area { padding: 12px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .pulse, .send-btn.stop { animation: none !important; }
+}

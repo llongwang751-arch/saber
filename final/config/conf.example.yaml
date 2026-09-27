@@ -1,0 +1,41 @@
+# Copy to conf.yaml. Paths in this file are relative to this directory.
+# AGI_CONFIG explicitly selects it if config.local.yaml also exists.
+llm:
+  api_url: ${AGI_LLM_API_URL}  # complete /v1/chat/completions URL
+  api_key: ${AGI_LLM_API_KEY}
+  model: ${AGI_LLM_MODEL}
+  temperature: 0.2
+search:
+  api_key: ${TAVILY_API_KEY}  # optional when researching uploaded documents
+  api_url: https://api.tavily.com/search
+rag:
+  profile: local  # SQLite keyword retrieval; no embedding service required
+  top_k: 5
+research:
+  max_rounds: 3
+  max_llm_calls: 16
+  max_tool_calls: 20
+  max_sources: 20
+  max_output_tokens: 6000
+  max_context_chars: 24000
+  timeout_seconds: 300
+features:
+  medical: false
+  farm: false
+  experiments: false
+tools:
+  manifest: tools.example.yaml
+sandbox:
+  enabled: false
+  backend: docker
+  image: python:3.11-slim
+  network_disabled: true
+  readonly_rootfs: true
+  timeout_ms: 30000
+  memory_limit_mb: 256
+skillhub:
+  enabled: false
+server:
+  port: 8090
+auth:
+  jwt_secret: ${AGI_JWT_SECRET}

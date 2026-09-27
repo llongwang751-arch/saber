@@ -110,3 +110,12 @@ def test_client_disconnect_cancels_in_flight_stream():
     assert agent.cancel_observed.wait(timeout=5), (
         "客户端断连后 agent 未收到取消令牌，请求仍在后台空转"
     )
+    service = app.state.native_run_service
+    runs = service.list(agent.user_id)
+    assert runs[0]["kind"] == "chat_stream"
+    for _ in range(100):
+        if service.get(agent.user_id, runs[0]["run_id"])["status"] == "cancelled":
+            break
+        time.sleep(.01)
+    assert service.get(agent.user_id, runs[0]["run_id"])["status"] == "cancelled"
+    service.close()

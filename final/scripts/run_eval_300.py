@@ -18,7 +18,7 @@ import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
 import openpyxl
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
@@ -28,7 +28,6 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from config.config import APIConfig
 from internal.agent.router import detect_tool, need_react, need_tool
 from internal.memory.memory import Preference, ShortTerm
 from internal.rag.local_reranker import LocalOverlapReranker
@@ -608,7 +607,6 @@ def export_report_excel(overall_data: Dict[str, Any], path: Path) -> None:
     sub_header_fill = PatternFill(start_color="2F5597", end_color="2F5597", fill_type="solid")
     header_font = Font(name="微软雅黑", size=11, bold=True, color="FFFFFF")
     cell_font = Font(name="微软雅黑", size=10)
-    bold_font = Font(name="微软雅黑", size=10, bold=True)
     border_thin = Border(
         left=Side(style="thin", color="D9D9D9"),
         right=Side(style="thin", color="D9D9D9"),

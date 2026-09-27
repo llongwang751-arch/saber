@@ -29,6 +29,12 @@ export async function fetchJSON(path, options) {
   const raw = await resp.text()
   let data = {}
   if (raw) { try { data = JSON.parse(raw) } catch { data = { error: raw } } }
-  if (!resp.ok) throw new Error(data.error || data.detail || raw || `HTTP ${resp.status}`)
+  if (!resp.ok) {
+    const detail = data.error || data.detail || raw || `HTTP ${resp.status}`
+    const error = new Error(typeof detail === 'string' ? detail : JSON.stringify(detail))
+    error.status = resp.status
+    error.data = data
+    throw error
+  }
   return data
 }

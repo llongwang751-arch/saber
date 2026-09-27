@@ -95,7 +95,7 @@ def restore_graph(task, agent):
     return task, graph
 
 
-def resume_task(owner, task_id, conversation_id):
+def resume_task(owner, task_id, conversation_id, *, cancel_token=None, on_event=None):
     """Only task ID and conversation ID are client inputs; no client graph/params."""
     from internal.agent.graph_runtime import GraphConfig, GraphRuntime
     from internal.harness.execution import start_session
@@ -131,12 +131,15 @@ def resume_task(owner, task_id, conversation_id):
             start_session(policy)
             if policy.interrupted:
                 raise RecoveryConflict(policy.interrupted_reason)
-            token, unregister = agent._cancel_registry.register()
+            if cancel_token is None:
+                token, unregister = agent._cancel_registry.register()
+            else:
+                token, unregister = cancel_token, lambda: None
             try:
                 agent._cancel_registry.set_task(task)
                 task.update(status='running', phase='resuming')
                 runtime = GraphRuntime(graph, agent, GraphConfig(max_parallel=1, enable_racing=False),
-                                       agent.tool_executor.snapshot(), task)
+                                       agent.tool_executor.snapshot(), task, on_event=on_event)
                 runtime._lease = lease
                 runtime.query = task.get('query', '')
                 with request_budget(agent.cfg.max_llm_calls_per_turn, agent.cfg.max_tool_calls_per_turn):

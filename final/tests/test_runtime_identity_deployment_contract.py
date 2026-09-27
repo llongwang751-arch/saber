@@ -141,7 +141,9 @@ def test_application_wires_verified_runtime_provider_in_production(
     class Infra:
         pass
 
-    app = setup_routes(Agent(), Infra(), APIConfig(), auth_required=True)
+    cfg = APIConfig()
+    cfg.enable_experiments = True
+    app = setup_routes(Agent(), Infra(), cfg, auth_required=True)
     try:
         readiness = app.state.experiment_service.readiness()
         assert calls

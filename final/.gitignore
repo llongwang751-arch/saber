@@ -8,6 +8,7 @@ build/
 dist/
 .pytest_cache/
 .pytest*/
+.test-runtime/
 .mypy_cache/
 .ruff_cache/
 
@@ -44,6 +45,8 @@ tmp/
 
 # 含密钥的本地配置
 config/config.local.yaml
+config/conf.yaml
+config/tools.local.yaml
 .env
 .env.*
 !.env.example

@@ -13,10 +13,17 @@
       </button>
     </div>
 
-    <div class="tools-btn-wrap">
+    <div v-if="features.medical" class="tools-btn-wrap">
       <button class="tools-btn medical-entry" type="button" @click="$emit('open-medical')">
         <svg class="control-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v16m-8-8h16"/></svg>
         <span>智慧云诊室</span>
+      </button>
+    </div>
+
+    <div v-if="features.research" class="tools-btn-wrap">
+      <button class="tools-btn native-run-entry" type="button" @click="$emit('open-research')">
+        <svg class="control-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10" cy="10" r="6"/><path d="m15 15 5 5M7 10h6M10 7v6"/></svg>
+        <span>研究工作台</span>
       </button>
     </div>
 
@@ -24,6 +31,12 @@
       <button class="tools-btn eval-entry" type="button" @click="$emit('open-evaluation')">
         <span class="eval-mark">QA</span>
         <span>智能体评测</span>
+      </button>
+    </div>
+
+    <div class="tools-btn-wrap">
+      <button class="tools-btn native-run-entry" type="button" @click="$emit('open-native-runs')">
+        <span class="eval-mark">RUN</span><span>运行记录</span>
       </button>
     </div>
 
@@ -42,7 +55,8 @@
 import { useChat } from '../stores/chat'
 import { useSkills } from '../stores/skills'
 
-defineEmits(['open-skills', 'open-medical', 'open-evaluation', 'open-rag-lab'])
+defineProps({ features: { type: Object, default: () => ({ research: true, medical: false, experiments: false }) } })
+defineEmits(['open-skills', 'open-medical', 'open-evaluation', 'open-rag-lab', 'open-native-runs', 'open-research'])
 const chat = useChat()
 const skills = useSkills()
 </script>
@@ -59,4 +73,6 @@ const skills = useSkills()
 .eval-mark { font: 750 10px/1 ui-monospace, SFMono-Regular, Consolas, monospace; letter-spacing: .04em; }
 .raglab-entry { color: #075985; border-color: rgba(3,105,161,.23); }
 .raglab-entry:hover { background: #f0f9ff; border-color: #0284c7; }
+.native-run-entry { color: #0f766e; border-color: rgba(15,118,110,.25); }
+.native-run-entry:hover { background: #f0fdfa; }
 </style>

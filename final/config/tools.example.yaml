@@ -1,0 +1,11 @@
+# Operator-controlled manifest. true keeps a capability if configured;
+# it does not provision Docker, credentials or a knowledge base.
+builtins:
+  search_web: true
+  rag_search: true
+  exec_command: true
+mcp_servers: []
+# Example (disabled):
+#  - name: research-tools
+#    endpoint: https://your-mcp-server.example/mcp
+#    enabled: false
