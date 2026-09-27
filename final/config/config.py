@@ -5,6 +5,7 @@ import re
 from typing import Any, Dict, List, Optional
 
 import yaml
+from . import chat as chat_config
 from . import research as research_config
 
 logger = logging.getLogger(__name__)
@@ -33,6 +34,7 @@ def _project_root() -> str:
 _CONFIG_SCHEMA = {
     "features": set(),
     "research": set(research_config.LIMITS) | {"engine"},
+    "chat": {"engine"},
     "tools": {"manifest"},
     "llm": {"api_url", "api_key", "model", "fast_model", "temperature"},
     "embedding": {
@@ -137,6 +139,7 @@ class APIConfig:
 
     def __init__(self):
         research_config.initialize(self)
+        chat_config.initialize(self)
         self.rag_lightweight_enabled = False
         self.rag_lightweight_path = os.path.join(_project_root(), 'runtime', 'retrieval')
         # ---- LLM / Embedding ----
@@ -513,6 +516,7 @@ def default_config(config_path: Optional[str] = None) -> APIConfig:
 
     _apply_environment_overrides(c)
     research_config.configure(c, data)
+    chat_config.configure(c, data)
     if c.tools_manifest and not os.path.isabs(c.tools_manifest):
         c.tools_manifest = os.path.join(os.path.dirname(os.path.abspath(path)), c.tools_manifest)
     _apply_defaults(c)

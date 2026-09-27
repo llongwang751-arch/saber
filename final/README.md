@@ -1,14 +1,16 @@
 # AGI-Saber Research · 后端开发指南
 
-深度研究框架的服务端：FastAPI + 自研持久化运行时 + 研究引擎 + Vue 3 前端。项目定位与特性总览见 [根 README](../README.md)，从零跑通一次研究见 [研究快速开始](docs/research-quickstart.md)。本页面向**开发与调试**。
+深度研究框架的服务端：FastAPI + LangGraph 编排（chat / research 双 StateGraph）+ 自研持久化运行时 + React 18 前端。项目定位与特性总览见 [根 README](../README.md)，从零跑通一次研究见 [研究快速开始](docs/research-quickstart.md)。本页面向**开发与调试**。
 
 ## 目录速查
 
 | 路径 | 职责 |
 |---|---|
 | `main.py` / `internal/application/bootstrap.py` | 启动入口与组合根（配置 → 基础设施 → UnifiedAgent → 路由装配） |
-| `internal/agent/` | 运行时核心：`turn_service` 三段式编排、`planner` 计划、`run_scheduler` 持久化调度、`recovery` 恢复重放 |
-| `internal/research/` | 研究引擎：迭代检索循环、来源账本、引用报告、沙箱 coder |
+| `internal/chat_graph/` | LangGraph 聊天编排：policy → prepare/路由 → react / research(rag_agent) / rag / chat → finalize（`chat.engine` 可切 native 回退） |
+| `internal/agent/` | 运行时核心：`planner` 计划、`planning_service` ReAct/子代理执行、`run_scheduler` 持久化调度、`recovery` 恢复重放 |
+| `internal/research/` | 研究引擎：迭代检索循环、来源账本、引用报告、沙箱 coder（被 research_graph 节点复用） |
+| `internal/research_graph/` | LangGraph 研究引擎：plan → interrupt 审批 → Send 并行研究 → coder → report（`research.engine` 可切 native） |
 | `internal/handler/` | HTTP 边界：`chat_routes`（SSE 推流）、`run_routes`（断线重放）、文档/工具路由 |
 | `internal/rag/` | 三路混合检索（Milvus/ES/Neo4j RRF）与降级档 |
 | `internal/tools/` | 工具执行器、MCP 客户端（Streamable HTTP） |

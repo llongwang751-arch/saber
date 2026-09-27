@@ -12,7 +12,7 @@ rag:
   profile: local  # SQLite keyword retrieval; no embedding service required
   top_k: 5
 research:
-  engine: native  # research orchestration backend: native (built-in loop) or langgraph (StateGraph + interrupt/Send)
+  engine: langgraph  # research orchestration backend: langgraph (StateGraph + interrupt/Send) or native (built-in loop)
   max_rounds: 3
   max_llm_calls: 16
   max_tool_calls: 20
@@ -20,6 +20,8 @@ research:
   max_output_tokens: 6000
   max_context_chars: 24000
   timeout_seconds: 300
+chat:
+  engine: langgraph  # chat orchestration backend: langgraph (StateGraph) or native (legacy turn service)
 tools:
   manifest: tools.example.yaml
 sandbox:

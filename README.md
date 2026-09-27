@@ -17,6 +17,7 @@
 
 ### 生产级运行时（与同类框架的差异化）
 
+- **LangGraph 编排**：聊天与研究的编排层运行在 LangGraph StateGraph 上（chat：policy 门禁 → 意图路由 → react / research / rag / chat 分支 → finalize；research：plan → interrupt 审批 → Send 并行研究 → coder → report），节点复用既有记忆/检索/工具/预算服务，SSE 事件契约与原生路径逐字对齐
 - **持久化运行台账**：每个 run / worker / 事件落 SQLite，worker 心跳 + 任务租约（TTL）+ 围栏令牌，杜绝双接管与僵尸写入
 - **动作日志重放恢复**：崩溃后只重放确定成功的步骤，副作用不确定的动作禁止自动重放
 - **SSE 断线重放**：`Last-Event-ID` 游标 + 事件表回放，浏览器断网/重启后从断点续看
@@ -38,7 +39,7 @@
 
 ### 质量工程
 
-- **678 项自动化测试**（含取消、断连、并发、恢复重放、沙箱生命周期）+ ruff 正确性门禁 + GitHub Actions CI
+- **704 项自动化测试**（含取消、断连、并发、恢复重放、沙箱生命周期、双引擎事件奇偶校验）+ ruff 正确性门禁 + GitHub Actions CI（pytest × Python 3.11/3.13 + 前端 node 20）
 - **内置评测平台**：不可变数据集、确定性指标、Trace 全链路、Badcase 回归与版本对比
 - **确定性离线示例**：`examples/research/offline_demo.py` 不配置任何模型即可验证两轮研究与引用报告
 
@@ -52,6 +53,7 @@ graph TB
     subgraph Server["FastAPI (port 8090)"]
         API["HTTP 边界<br/>chat SSE · run 重放 · 文档 · 工具"]
         RS["RunService 运行调度<br/>SQLite 台账 · 租约/围栏 · 事件重放"]
+        LG["LangGraph 编排（StateGraph）<br/>chat 路由/研究/报告 · research 计划/审批/并行"]
         P["Planner 规划器"]
         G["GraphRuntime 图执行<br/>拓扑分层 · 并行子代理"]
         RE["ResearchEngine 研究引擎<br/>迭代循环 · 来源账本 · 引用报告"]
@@ -62,10 +64,12 @@ graph TB
         SBX["Docker 沙箱"]
         MCP["MCP Servers"]
     end
-    WB -->|SSE| API --> RS
-    RS --> P -->|AWAITING_PLAN_REVIEW 暂停| WB
-    WB -->|approve/edit| RS --> G --> RE
-    RE --> TAV & RAG & SBX & MCP
+    WB -->|SSE| API --> RS --> LG
+    LG -->|interrupt 暂停待审批| WB
+    WB -->|approve/edit| LG
+    LG --> P --> G
+    LG --> RE
+    RE & G --> TAV & RAG & SBX & MCP
 ```
 
 一次研究任务的状态流转：`创建 run → 生成计划 → **暂停待审批** → 人工批准/编辑 → 分步执行（research / code / write）→ 引用校验 → 报告产物落盘 → 完成`。任何一步崩溃都可从台账恢复。
@@ -130,8 +134,10 @@ python final/examples/research/offline_demo.py
 │   ├── main.py                  # 启动入口（组合根 bootstrap.build_deps）
 │   ├── config/                  # conf.example.yaml（精简）/ config.yaml（全套）
 │   ├── internal/
-│   │   ├── agent/               # turn_service 编排 / planner / run_scheduler / recovery
-│   │   ├── research/            # 研究引擎：迭代循环 / 来源账本 / 引用报告 / 沙箱 coder
+│   │   ├── chat_graph/          # LangGraph 聊天编排：policy/prepare → react/research/rag/chat → finalize（native 回退保留）
+│   │   ├── research_graph/      # LangGraph 研究引擎：plan → interrupt 审批 → Send 并行 → coder → report
+│   │   ├── agent/               # planner / planning_service / run_scheduler / recovery / run_repository
+│   │   ├── research/            # 研究引擎：迭代循环 / 来源账本 / 引用报告 / 沙箱 coder（被 research_graph 节点复用）
 │   │   ├── handler/             # HTTP 边界：chat SSE / run 断线重放 / 文档 / 工具路由
 │   │   ├── rag/                 # 三路混合检索与降级
 │   │   ├── tools/               # 工具执行器 + MCP 客户端
@@ -140,7 +146,7 @@ python final/examples/research/offline_demo.py
 │   │   └── evaluation/          # 内置评测平台
 │   ├── web/                     # React 18 + Vite + TypeScript + Zustand（研究工作台 / PlanReview / ReportInline）
 │   ├── examples/research/       # 确定性离线示例
-│   ├── tests/                   # 678 项测试
+│   ├── tests/                   # 704 项测试
 │   └── scripts/                 # run_research_local / demo_research / smoke_research
 └── LICENSE                      # MIT
 ```

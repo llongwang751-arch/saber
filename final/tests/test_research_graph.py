@@ -291,7 +291,7 @@ def test_engine_selection_keeps_native_as_default(tmp_path):
 def test_research_engine_config_defaults_validation_and_override(tmp_path, monkeypatch):
     monkeypatch.setattr("config.config._load_dotenv_best_effort", lambda: None)
     monkeypatch.delenv("AGI_RESEARCH_ENGINE", raising=False)
-    assert APIConfig().research_engine == "native"
+    assert APIConfig().research_engine == "langgraph"
 
     path = tmp_path / "conf.yaml"
     path.write_text("research:\n  engine: langgraph\n", encoding="utf-8")

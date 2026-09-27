@@ -40,7 +40,7 @@ from .status import infra_status, status as build_status
 from .subagents import register_builtin_subagents
 
 
-from . import context_service, memory_service, retrieval_service, document_service, planning_service, turn_service
+from . import context_service, memory_service, retrieval_service, document_service, planning_service
 from .contracts import (
     StepType as StepType,
     ReActStep as ReActStep,
@@ -385,9 +385,15 @@ class UnifiedAgent:
         return infra_status(self)
 
     # ── 调度主循环 ─────────────────────────────────────────────────────────
+    #
+    # 聊天回合编排自 L3c 起由 internal/chat_graph 承担（LangGraph StateGraph，
+    # 默认 engine；chat.engine: native 保留原生回退路径）。以下 facade 方法
+    # 保持原有签名，供图节点与测试复用同一批 agent 方法。
 
     def _dispatch(self, query, opts, token, on_event=None, execution_context=None):
-        return turn_service.dispatch(self, query, opts, token, on_event, execution_context)
+        from internal.chat_graph import dispatch
+
+        return dispatch(self, query, opts, token, on_event, execution_context)
 
     def _dispatch_once(
         self,
@@ -397,29 +403,41 @@ class UnifiedAgent:
         on_event=None,
         execution_context: Optional[RequestExecutionContext] = None,
     ) -> Response:
-        return turn_service.dispatch_once(self, query, opts, token, on_event, execution_context)
+        from internal.chat_graph import dispatch_once
+
+        return dispatch_once(self, query, opts, token, on_event, execution_context)
 
     # ── prepare ──────────────────────────────────────────────────────────────
 
     def _prepare(
         self, query: str, opts: ChatOptions, execution_context: Optional[RequestExecutionContext] = None
     ) -> Dict[str, Any]:
-        return turn_service.prepare(self, query, opts, execution_context, memory_update=async_update_memory)
+        from internal.chat_graph import prepare
+
+        return prepare(self, query, opts, execution_context, memory_update=async_update_memory)
 
     def _route_decide(self, query: str, opts: ChatOptions):
-        return turn_service.route_decide(self, query, opts)
+        from internal.chat_graph import route_decide
+
+        return route_decide(self, query, opts)
 
     @staticmethod
     def _report_intent(query: str) -> bool:
-        return turn_service.report_intent(query)
+        from internal.chat_graph import report_intent
+
+        return report_intent(query)
 
     def _report_intent_refined(self, query: str) -> bool:
-        return turn_service.report_intent_refined(self, query)
+        from internal.chat_graph import report_intent_refined
+
+        return report_intent_refined(self, query)
 
     # ── dispatch ─────────────────────────────────────────────────────────────
 
     def _dispatch_mode(self, pr: Dict[str, Any], resp: Response, token, on_event=None) -> None:
-        return turn_service.dispatch_mode(self, pr, resp, token, on_event)
+        from internal.chat_graph import dispatch_mode
+
+        return dispatch_mode(self, pr, resp, token, on_event)
 
     # ── finalize ─────────────────────────────────────────────────────────────
 

@@ -1,6 +1,11 @@
-"""Turn service for an explicitly supplied conversation runtime.
+"""Native (pre-LangGraph) chat turn orchestration, moved verbatim from
+``internal/agent/turn_service.py`` when the chat modes entered the graph.
 
-The caller owns mutable state and lifecycle; services do not retain a user or conversation.
+Kept as the reference implementation behind ``chat.engine: native`` and as the
+parity baseline for :mod:`tests.test_chat_graph`. The LangGraph engine composes
+the exact same functions (``prepare`` / ``route_decide`` / ``dispatch_mode``
+semantics live on through its nodes), so both engines stay behaviourally
+identical at the SSE boundary.
 """
 
 import logging
@@ -8,21 +13,19 @@ import os
 import uuid
 from typing import Any, Dict, Optional
 
-
-from .planner import (
+from internal.agent.planner import (
     needs_subagent_plan,
     refine_intent_with_llm,
 )
 
-
-from .contracts import StepType, ChatOptions, RequestExecutionContext, Response
-from .serialization import _emit, _to_jsonable
+from internal.agent.contracts import StepType, ChatOptions, RequestExecutionContext, Response
+from internal.agent.serialization import _emit, _to_jsonable
 
 logger = logging.getLogger(__name__)
 
 
 def dispatch(agent, query, opts, token, on_event=None, execution_context=None):
-    from .conversations import ConversationBusy
+    from internal.agent.conversations import ConversationBusy
 
     # The legacy/default conversation also has a single in-flight turn.
     lock = getattr(agent, "_turn_lock", None)

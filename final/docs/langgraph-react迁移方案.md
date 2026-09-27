@@ -57,3 +57,15 @@
 ## 4. 教学路线影响
 
 第三课起的课程改在新栈上讲：L3 持久化 run 层（仍成立，事件表未变）→ LangGraph 内部机制课（StateGraph/checkpointer/interrupt/Send，对照自研 graph_runtime）→ React 前端课。已上的第一、二课内容在 L3 切换前仍然有效。
+
+## 5. L3c 完成记录（2026-09-27）
+
+聊天三模式入图、研究引擎默认切换与原生聊天编排退役，全部验收通过。
+
+- **chat 入图**：新增 `final/internal/chat_graph/`（`state.py` / `graph.py` / `engine.py` / `native.py`）。StateGraph 拓扑：`START → policy（harness 门禁）→ prepare（STM 写入 + 记忆抽取 + 两级意图漏斗 + 上下文装配，逐字移植 turn_service）→ 条件路由 → react / research(rag_agent) / rag / chat → finalize → END`，另有 `cancel` 分支承接"路由后、分发前"的取消检查点。所有节点调用与原生编排完全相同的 agent 方法（`_prepare` / `_run_react_with_tools` / `_run_rag_query_with_trace` / `_chat_response` / `_finalize`），rag_agent 仍走强制子代理计划 → TaskGraph → GraphRuntime 机制，未削弱。
+- **双引擎一接口**：`chat.engine: native | langgraph`（默认 `langgraph`，环境变量 `AGI_CHAT_ENGINE`），配置面仿 `config/research.py`；`internal.chat_graph.dispatch` 按 engine 分发，HTTP 层零改动。会话 `_turn_lock` + `ConversationBusy`、`request_budget` 包装、三处取消检查点、SSE 事件词汇与顺序全部保留。
+- **奇偶校验**：`tests/test_chat_graph.py` 以 native 实现为基准做共享确定性 mock 的逐事件对比（含流式 token、工具调用、rag trace、研究子代理管线、中途取消、会话忙、预算耗尽、护栏拒绝）；仅归一化 `task_id` 与 `duration_ms` 两个已知随机字段，其余字节级一致。
+- **默认切换**：`research.engine` 默认值 `native → langgraph`（`config/research.py` + `conf.example.yaml`）；`tests/test_research_graph.py` 相应断言更新为新默认。
+- **退役**：`internal/agent/turn_service.py` 已删除（逻辑逐字移入 `chat_graph/native.py`，作为 `native` 引擎与奇偶基准保留）。`graph_runtime.py` 与 `planner.py` **保留**：`recovery.py`（本阶段禁改）直接导入 `GraphRuntime`/`GraphConfig`，`planning_service` 与重规划路径依赖 planner/GraphRuntime——它们是 react 执行机制而非聊天回合编排，等同于 research_graph 复用 `internal/research/` 的关系。
+- **CI**：`.github/workflows/tests.yml` 新增 `web` job（setup-node 20 → `npm ci` → `npm test` → `npm run build`）与 pytest job 并行。
+- **验收**：pytest 703 passed / 1 skipped；ruff 全绿；`web` 22 项测试通过 + Vite 构建成功。
