@@ -15,7 +15,7 @@
 | `internal/harness/` | 危险工具审批、安全护栏、动作日志 |
 | `internal/infra/` | PG/ES/Milvus/Neo4j/Kafka 生命周期，逐依赖熔断降级 |
 | `internal/evaluation/` | 内置评测平台（独立 SQLite 存储，离线可跑） |
-| `web/` | Vue 3 + Pinia 前端（研究工作台、PlanReview、报告阅读） |
+| `web/` | React 18 + Vite + TypeScript + Zustand 前端（研究工作台、PlanReview、报告阅读） |
 | `runtime/` | 本地运行产物（运行台账、报告、评测数据），gitignore，不入库 |
 
 ## 环境要求

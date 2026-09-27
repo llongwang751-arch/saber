@@ -43,9 +43,9 @@ body {
   position: relative;
 }
 
-/* Vue 挂载点：让 #app 透明化，使其子元素（sidebar/main/modals）
+/* React 挂载点：让 #root 透明化，使其子元素（sidebar/main/modals）
    直接作为 body 的 flex 子项参与布局——等价于旧版 body 直接托管布局。 */
-#app { display: contents; }
+#root { display: contents; }
 
 /* ── 背景装饰（极简科技网格 + 柔光） ── */
 .bg-decor {

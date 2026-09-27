@@ -46,7 +46,7 @@
 
 ```mermaid
 graph TB
-    subgraph Client["Vue 3 + Pinia"]
+    subgraph Client["React 18 + Zustand"]
         WB["研究工作台<br/>计划审批 / 过程观察 / 报告阅读"]
     end
     subgraph Server["FastAPI (port 8090)"]
@@ -138,7 +138,7 @@ python final/examples/research/offline_demo.py
 │   │   ├── harness/             # 危险工具审批与安全护栏
 │   │   ├── infra/               # 外部依赖生命周期，逐依赖熔断降级
 │   │   └── evaluation/          # 内置评测平台
-│   ├── web/                     # Vue 3 + Pinia（研究工作台 / PlanReview / ReportInline）
+│   ├── web/                     # React 18 + Vite + TypeScript + Zustand（研究工作台 / PlanReview / ReportInline）
 │   ├── examples/research/       # 确定性离线示例
 │   ├── tests/                   # 678 项测试
 │   └── scripts/                 # run_research_local / demo_research / smoke_research
